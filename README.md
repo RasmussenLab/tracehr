@@ -92,7 +92,7 @@ and the intervals between them.
 Python 3.10–3.14 (3.12 recommended).
 
 ```bash
-git clone https://github.com/fotiniak/tracehr.git
+git clone https://github.com/RasmussenLab/tracehr.git
 cd tracehr
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install .            # pip install -e .  for development
@@ -329,7 +329,7 @@ Alternatively:
   title   = {{TracEHR}: Autoregressive Transformer Training \& Inference for Electronic Health Records},
   year    = {2026},
   version = {0.1.0},
-  url     = {https://github.com/fotiniak/tracehr},
+  url     = {https://github.com/RasmussenLab/tracehr},
   note    = {Rasmussen Group, Novo Nordisk Foundation Center for Basic Metabolic Research (CBMR), University of Copenhagen}
 }
 ```

@@ -16,8 +16,8 @@ authors:
     orcid: "https://orcid.org/0000-0003-3209-4286"
 version: 0.1.0
 license: Apache-2.0
-repository-code: "https://github.com/fotiniak/tracehr"
-url: "https://github.com/fotiniak/tracehr"
+repository-code: "https://github.com/RasmussenLab/tracehr"
+url: "https://github.com/RasmussenLab/tracehr"
 keywords:
   - electronic health records
   - EHR

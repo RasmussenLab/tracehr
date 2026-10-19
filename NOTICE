@@ -4,7 +4,7 @@ Copyright 2026 University of Copenhagen
 This product includes software developed by Foteini Aktypi in the
 Rasmussen Group at the Novo Nordisk Foundation Center for Basic Metabolic
 Research (CBMR), University of Copenhagen
-(https://github.com/fotiniak/tracehr).
+(https://github.com/RasmussenLab/tracehr).
 
 Licensed under the Apache License, Version 2.0 (see LICENSE). Anyone who
 redistributes TracEHR, or a work based on it, must keep the attribution
@@ -18,7 +18,7 @@ README.md:
 
   Aktypi, F. (2026). TracEHR: Autoregressive Transformer Training &
   Inference for Electronic Health Records (Version 0.1.0) [Computer
-  software]. https://github.com/fotiniak/tracehr
+  software]. https://github.com/RasmussenLab/tracehr
 
 Third-party material
 --------------------
