@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]   # 77: SPDX `license` string
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracehr"
+version = "0.1.0"
+description = "EHR sequences + decoder-only transformer tooling"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Foteini Aktypi" }]
+requires-python = ">=3.10"
+# Minimum versions are the oldest tested; upper bounds only where a release is known to break.
+# torch: install the build for your GPU and driver first (README); pip then keeps it.
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1,<3",      # pandas 3 stores missing strings differently in the 03/04 outputs
+    "pyarrow>=16",
+    "duckdb>=1.5",         # to_arrow_table() / to_arrow_reader()
+    "torch>=2.3",          # torch.amp.GradScaler(device)
+    "tqdm",
+    "matplotlib>=3.10",    # violinplot(orientation=)
+    "scikit-learn>=1.6",   # GroupKFold(shuffle=True) for patient-grouped CV folds
+    "scipy>=1.13",
+    "PyYAML>=6.0.1",
+    "xgboost>=2.1",        # predict() uses every tree (2.0+)
+    "joblib>=1.4",         # saves the fitted linear models
+]
+
+[project.scripts]
+tracehr-train = "tracehr.pipelines.train_model:cli"
+tracehr-evaluate = "tracehr.pipelines.evaluate_model:cli"
+tracehr-generate = "tracehr.pipelines.generate_tokens:cli"
+tracehr-embed = "tracehr.pipelines.extract_embeddings:cli"
+tracehr-finetune = "tracehr.pipelines.finetune_model:cli"
+tracehr-outcome = "tracehr.pipelines.outcome_probe_prediction:cli"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tracehr*"]

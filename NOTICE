@@ -1,0 +1,26 @@
+TracEHR
+Copyright 2026 University of Copenhagen
+
+This product includes software developed by Foteini Aktypi in the
+Rasmussen Group at the Novo Nordisk Foundation Center for Basic Metabolic
+Research (CBMR), University of Copenhagen
+(https://github.com/fotiniak/tracehr).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). Anyone who
+redistributes TracEHR, or a work based on it, must keep the attribution
+notices in this file (Apache License 2.0, Section 4(d)).
+
+Citation
+--------
+If you use TracEHR in research or in a publication, please cite it. The
+full reference is in CITATION.cff and in the "Citing TracEHR" section of
+README.md:
+
+  Aktypi, F. (2026). TracEHR: Autoregressive Transformer Training &
+  Inference for Electronic Health Records (Version 0.1.0) [Computer
+  software]. https://github.com/fotiniak/tracehr
+
+Third-party material
+--------------------
+src/tracehr/ntp_model/halo.py adapts the HALO loss from
+https://github.com/4rtemi5/halo (by 4rtemi5).

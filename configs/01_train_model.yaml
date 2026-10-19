@@ -1,0 +1,80 @@
+# configs/01_train_model.yaml
+
+# Hardware settings
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu"
+  num_workers: 8
+  pin_memory: true
+
+# Data i/o settings
+data:
+  mode: "streaming" # options: "streaming" or "save_intermediate"
+  shuffle_buffer_windows: 8192 # larger value = better shuffle, more RAM smaller value = less RAM, weaker shuffle, 0 or 1 = no shuffling, deterministic order
+  shuffle_simultaneous: true # train-time: randomly reorder events sharing the same Age (breaks token-id tie-order; the sex and static tokens are never shuffled)
+  parquet_path: "data/synthetic/meds/data" # MEDS input: one parquet file, or a folder of parquet shards (read recursively)
+  train_ids: "data/synthetic/train_ids.parquet" # one-column parquet with patient IDs for training
+  val_ids: "data/synthetic/val_ids.parquet" # one-column parquet with patient IDs for validation
+  vocab_path: "data/synthetic/vocabulary.json" # vocabulary json file (if it exists it will be used if not it will be created)
+  train_npz: "data/synthetic/train_windows.npy" # single memory-mapped window store; only used when mode: save_intermediate
+  val_npz: "data/synthetic/val_windows.npy" # single memory-mapped window store; only used when mode: save_intermediate. Always built without overlap or tail window (each val token scored once), whatever window_overlap is
+  output_dir: "data/outputs/tokens_only_ce_streaming/" # output directory for model checkpoints and logs
+  model_checkpoint_path: null # any checkpoint .pt file to resume from (first choice when it exists); otherwise <output_dir>/latest.pt is resumed when it exists, else training starts from scratch. A resume keeps every training setting and the vocabulary; the dataset may change (see src/tracehr/training/resume.py)
+
+# Column names of the MEDS input (all required; every parquet file is checked against
+# them at startup). time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when model.use_type is false
+
+# Sequence / tokenization settings
+sequences:
+  unk_token: "<UNK>"   # string your data uses to mark rare tokens; excluded from the learned vocab and mapped to the special <UNK> id. Omit -> "<UNK>".
+  birth_token: "MEDS_BIRTH"   # code of each patient's birth row (required): the clock origin, never a token; a patient without a timed one is dropped and reported
+  sex_tokens: ["male", "female"]   # exact token strings (post-normalization) treated as sex; omit or [] = none
+  # Further tokens of the front block (after the sex token, alphabetically, at the birth): never targets,
+  # never shuffled, visible at every anchor. Matched like data tokens (case and surrounding spaces ignored);
+  # may repeat sex tokens; omit or [] = none. At most MAX_PREAMBLE_LEN - 2 = 8 per patient (windows.py).
+  static_tokens: ["REGION//CAPITAL", "REGION//EAST", "REGION//NORTH", "REGION//SOUTH", "REGION//WEST"]
+  min_seq_len: 3
+
+# Model parameters
+model:
+  # architecture
+  d_model: 64 # embedding dimension
+  n_heads: 4 # number of attention heads
+  n_layers: 4 # number of transformer layers
+  max_seq_len: 256 # maximum sequence length, context window
+  loss_mode: "cross_entropy" # token objective; one of the names registered in TOKEN_LOSSES (src/tracehr/ntp_model/ntp_transformer.py)
+  dropout: 0.1 # dropout rate
+  # token representations
+  use_time_age: false # whether to use age time embeddings (time_age: days since the birth)
+  use_time_abs: false # whether to use absolute time embeddings (time_abs: days since EARLIEST_TIMESTAMP, duckdb_stream.py)
+  use_type: false # whether to use type embeddings
+  window_overlap: 20 # 0-100 - the overlap between windows of the same patient for training 0 - 99
+  time_fourier_dims: 16 # number of sin/cos frequency pairs in the time embeddings
+  rope_mode: "age" # "index" = position is the token index (default) | "age" = position is Age in DAYS | "hybrid" = split head dims between both
+  rope_base: 10000.0 # base for rotary positional embeddings; applies to the INDEX block only (the Age block derives its own)
+  # time-to-event prediction
+  t2e_weight: 0.0 # 0 = off; >0 enables coupled competing-risk T2E and is its loss multiplier; deltas in DAYS
+
+# Training settings
+training:
+  num_epochs: 5 # total number of training epochs; raising it on resume extends the run (linear/cosine warm up again and decay over the added epochs)
+  batch_size: 64 # batch size
+  learning_rate: 0.001 # learning rate
+  weight_decay: 0.1 
+  lr_scheduler: "cosine"  # Options: constant, linear, cosine (both decay to 0.1x learning_rate after warmup)
+  warmup_steps: 500
+  grad_clip: 1.0
+  seed: 101010
+
+# Logging and checkpointing
+checkpoint:
+  save_every: 1 # save checkpoint every N epochs
+  keep_last_n: 2 # number of last checkpoints to keep
+
+
+  
+  

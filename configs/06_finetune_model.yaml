@@ -1,0 +1,82 @@
+# configs/06_finetune_model.yaml
+#
+# Task-generic outcome finetuning from RAW data. The ONE outcomes file is
+# auto-partitioned by the ORIGINAL pretraining split id files, so pretraining
+# split membership is preserved. All times are DAYS.
+
+hardware:
+  device: "auto"
+  num_workers: 4
+  pin_memory: true
+
+# Pretrained backbone to finetune, and the finetune checkpoint to resume from
+checkpoint:
+  pretrained_checkpoint_path: "data/outputs/tokens_only_ce_streaming/best_model.pt"
+  finetuned_checkpoint_path: null  # any finetune checkpoint .pt file to resume from (first choice when it exists); otherwise <output_dir>/latest.pt is resumed when it exists, else finetuning starts from scratch
+
+data:
+  vocab_path: "data/synthetic/vocabulary.json"
+
+finetuning:
+  output_dir: "data/outputs/tokens_only_ce_streaming/finetuned/"
+  raw_parquet_path: "data/synthetic/meds/data"   # MEDS input: a parquet file or a folder of shards
+  anchors_path: "data/synthetic/outcomes.parquet"       # ONE file: patient id, anchor timestamp, target
+  train_ids: "data/synthetic/train_ids.parquet"         # ORIGINAL pretraining splits — outcomes file
+  val_ids: "data/synthetic/val_ids.parquet"             # is auto-partitioned by these id files
+  test_ids: "data/synthetic/test_ids.parquet"
+
+  task: "binary"               # regression | binary | multiclass | survival
+                               # survival also requires anchor_columns.censor_timestamp_col below
+
+  # Cutoff (same flag as 03/04/05): remove_cutoff_token true keeps events with
+  # time_age < anchor - time_before_event (the anchor event is dropped); false keeps time_age <= ...
+  # (the anchor event stays in the input). With false the anchor must be the prediction
+  # time: an outcome-onset anchor would put the outcome event itself into the input.
+  time_before_event: 0
+  remove_cutoff_token: false    # false flips the cutoff to <= so the anchor event is kept
+  max_seq_len: null             # omit/null = use the pretrained backbone's context; set a smaller int to truncate
+
+  # Task head
+  pooling: "mean"              # last | mean | max | attention
+  dropout: 0.1
+
+  # Optimization
+  strategy: "two_phase"        # probe | full | two_phase
+  freeze_epochs: 2             # two_phase: head-only epochs before unfreezing the backbone
+  num_epochs: 20
+  batch_size: 64
+  lr: 1.0e-4
+  backbone_lr: 1.0e-5          # null = same as lr
+  weight_decay: 0.01
+  warmup_epochs: 2
+  early_stopping_patience: 5
+  grad_clip: 1.0
+
+# Column names of the MEDS input (every parquet file is checked against them at startup).
+# time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when the backbone was trained without Type
+
+# Column names of the outcomes parquet (finetuning.anchors_path)
+anchor_columns:
+  id_col: "subject_id"
+  timestamp_col: "prediction_time"   # anchor time, timestamp[us]; its time_age comes from the patient's birth
+  target_col: "target"     # outcome (required here)
+  # SURVIVAL ONLY (finetuning.task: survival). Naming a censor timestamp column makes
+  # target_col the 0/1 EVENT indicator and this column the timestamp[us] of the event
+  # (target 1) or of the censoring (target 0); tracehr computes the duration in DAYS from
+  # the anchor, and drops and reports rows without one or with one before the anchor.
+  # The head then trains on the Cox partial likelihood and is scored by Harrell's C-index.
+  # Leave it null (or delete the key) for every other task.
+  censor_timestamp_col: null
+
+explainability:
+  enabled: true
+  num_samples: 20              # most decisive test patients to explain (binary/multiclass: most confident;
+                               # regression/survival: farthest from the median); global importance pools only these
+  top_k_tokens: 25
+  n_steps: 50                  # Integrated Gradients interpolation steps
+  plot_attention: true

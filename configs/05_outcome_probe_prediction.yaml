@@ -1,0 +1,92 @@
+# configs/05_outcome_probe_prediction.yaml
+#
+# Downstream outcome prediction: the trained model is a frozen feature extractor. One
+# embedding per patient at a time anchor, then three models compared: Embedding->linear,
+# [Sex, last-token Age]->linear, bag-of-words->XGBoost (per-token counts over the patient's
+# FULL truncated history; special tokens always excluded). Train set = original train+val
+# patients, test = original test.
+#
+# The task is autodetected per outcomes file from its target column and printed: a 0/1
+# target gives classification (LogReg/XGBoost-logistic, AUROC/AUPRC/F1), any other numeric
+# target gives regression (Ridge/XGBoost-squarederror, R2/MAE/MSE). No key to set.
+#
+# Everything runs from the MEDS input - it is encoded inside DuckDB on the fly, so no
+# pre-encoded input is needed.
+
+# Hardware settings
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu"
+
+# Model checkpoint (the frozen feature extractor)
+checkpoint:
+  model_path: "data/outputs/tokens_only_ce_streaming/best_model.pt"
+  vocab_path: "data/synthetic/vocabulary.json"
+
+# Data settings
+data:
+  parquet_path: "data/synthetic/meds/data"  # MEDS input: a parquet file or a folder of shards
+
+outcome:
+  # streaming: one ordered pass, windows built and embedded in flight, nothing persisted.
+  # save_intermediate: the anchor-truncated windows are written once to windows_dir and
+  # embedded from there. The store depends only on the windowing geometry and the anchor
+  # cohort - NOT on pooling, combine_windows, batch_size or the checkpoint - so a sweep
+  # over those reuses it and skips the scan entirely. It is rebuilt automatically when the
+  # config, the vocabulary or the anchor cohort changes.
+  mode: "streaming"          # streaming | save_intermediate
+  outcomes_path: "data/outputs/comparisons_matched/outcomes_schizophrenia_matched.parquet" # one parquet or a list; cols: patient id, anchor timestamp, target (0/1 or continuous)
+  windows_dir: "data/outputs/anchor_windows/"  # save_intermediate only; one subfolder per outcomes file
+  train_ids: "data/synthetic/train_ids.parquet"
+  val_ids:   "data/synthetic/val_ids.parquet"
+  test_ids:  "data/synthetic/test_ids.parquet"
+
+  # Windowing (these define the saved store; changing one invalidates it)
+  # NOTE: the window floor (min_seq_len) is deliberately NOT a knob here. It must match the
+  # geometry the model was trained on, so it is read from the checkpoint's
+  # sequences.min_seq_len and printed at startup; setting it here is rejected. It gates both
+  # which patients can be embedded and how wide the earliest window is, and it is part of the
+  # store's staleness check.
+  overlap_percent: 0         # percent (0-100) overlap between consecutive windows; 0 = none
+  start_from_end: true       # right-align windows at the sequence end; the earliest window may be shorter
+  add_head_window: false     # right-aligned only. A head span narrower than the training floor is dropped; false leaves those oldest tokens in NO window (they still reach bag-of-words), true prepends a full-width [0:K) window to cover them. True re-reads up to K-1 tokens the next window already holds and combine_windows weights that near-duplicate like a real window, so false is the default. Part of the window store's staleness check.
+  time_before_event: 0       # days subtracted from the anchor before truncation (cutoff = anchor - time_before_event)
+  remove_cutoff_token: false # true keeps events with time_age < cutoff (the anchor event is dropped); false keeps time_age <= cutoff (the anchor event stays in the input - the anchor must then be the prediction time, or the outcome event leaks in)
+
+  # Embedding (free to vary without rebuilding the store)
+  pooling: "last"                      # within-window token pooling: mean | max | last | combined
+  combine_windows: "recency_weighted"  # reduce a patient's windows to one embedding: mean | max | recency_weighted | none (none = most-recent window only)
+  batch_size: 64                       # forward-pass batch size
+
+  # Model comparison (the six arms; free to vary without rebuilding the store)
+  n_folds: 5           # cross-validation folds, shared by all six arms so they stay comparable
+                       # fold-by-fold. Lowered automatically when a class (or event) is too rare
+                       # to fill this many folds; the reduction is printed when it happens.
+  random_state: 42     # seeds the fold split AND every estimator, so a run reproduces exactly.
+                       # Changing it re-splits the folds: re-run every arm before comparing.
+
+  # Performance
+  chunk_windows: 2048       # windows built before each flush to the model; caps peak memory
+  save_sequences: true     # true adds Sequence/Age columns along with the embedding (one Python object per token per patient - slow on large cohorts; streaming mode only)
+
+  output_dir: "data/outputs/tokens_only_ce_streaming/outcomes/"
+
+# Column names of the MEDS input (every parquet file is checked against them at startup).
+# time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when the model was trained without Type
+
+# Column names of the outcomes parquet(s) in outcome.outcomes_path
+anchor_columns:
+  id_col: "subject_id"
+  timestamp_col: "prediction_time"   # anchor time, timestamp[us]; its time_age comes from the patient's birth
+  target_col: "target"     # outcome, 0/1 or continuous (required here); task autodetected
+  # SURVIVAL ONLY. Naming a censor timestamp column switches the stage to a Cox task:
+  # target_col then has to be the 0/1 EVENT indicator and this column the timestamp[us] of
+  # the event (target 1) or of the censoring (target 0); tracehr computes the duration in
+  # DAYS from the anchor, and drops and reports rows without one or with one before the
+  # anchor. The six arms become penalised CoxPH / XGBoost survival:cox and report
+  # Harrell's C-index. Leave it null (or delete the key) for binary and regression outcomes.
+  censor_timestamp_col: null

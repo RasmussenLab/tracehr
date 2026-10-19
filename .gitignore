@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments and VSCode
+.venv/
+venv/
+.claude/*
+.vscode/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+# DuckDB's spill folder (can briefly hold patient data)
+.tmp/
+
+# OS
+.DS_Store
+
+# Data, models and outputs: never commit patient data or checkpoints, wherever they are placed
+/data/*
+*.pt
+*.parquet
+*.npz
+*.npy
+*.joblib
+
+# Local archive
+/archive/
+
+# Examples
+/code_reference/
+
+# Helpers
+commit.sh
+pip_install.sh
+/notebooks/*
+/tests/*
+# Delphi related analysis files
+#src/tracehr/pipelines/train_delphi.py
+#/configs/09_train_delphi.yaml
+#src/tracehr/pipelines/evaluate_delphi.py
+#/configs/10_evaluate_delphi.yaml
+#src/tracehr/pipelines/outcome_prediction_delphi.py
+#/configs/11_outcome_prediction_delphi.yaml
+#src/tracehr/ntp_model/delphi.py
+

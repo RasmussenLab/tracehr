@@ -1,0 +1,53 @@
+# configs/04_extract_embeddings.yaml
+
+# Hardware settings
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu"
+
+# Model checkpoint
+checkpoint:
+  model_path: "data/outputs/tokens_only_ce_streaming/best_model.pt"
+
+# Data settings
+data:
+  vocab_path: "data/synthetic/vocabulary.json"
+
+# Anchor-grid embedding extraction. ALL TIMES IN DAYS (time_age, anchors, timestep).
+# One row per (patient, grid step) lands in <output_dir>/anchor_embeddings.parquet, and the
+# settings that describe the run (pooling, window aggregation, embedding_dim, ...) land
+# beside it in embedding_extraction_meta.json rather than being repeated on every row.
+# Columns match pipeline 05's downstream_embeddings.parquet wherever they mean the same
+# thing; step_index/timestep/anchor_offset/is_final_step are the grid-only extras.
+extraction:
+  output_dir: "data/outputs/tokens_only_ce_streaming/embeddings/"
+  batch_size: 64
+  raw_parquet_path: "data/synthetic/meds/data"  # MEDS input: a parquet file or a folder of shards
+  anchors_path: "data/outputs/comparisons_matched/outcomes_schizophrenia_matched.parquet"  # parquet with patient id + anchor timestamp (target column not needed)
+  timestep: null            # null/0 = one embedding at the anchor; >0 = embeddings at anchor + 0,1,2,...*timestep (DAYS) until the full history is consumed
+  pooling: "last"           # within-window token pooling: mean | max | last
+  # NOTE: the window floor (min_seq_len) is deliberately NOT a knob here. It must match the
+  # geometry the model was trained on, so it is read from the checkpoint's
+  # sequences.min_seq_len and printed at startup; setting it here is rejected. It drops grid
+  # steps with too little history and keeps the earliest window from being narrower than any
+  # window the model saw in training.
+  overlap_percent: 0        # percent (0-100) overlap between consecutive windows; 0 = none (same convention as training's window_overlap)
+  start_from_end: true      # right-align windows at the sequence end; the earliest window may be shorter than the context (but never narrower than the training floor)
+  add_head_window: false    # right-aligned only. A head span narrower than the training floor is dropped; false leaves those oldest tokens in NO window (they still reach bag-of-words), true prepends a full-width [0:K) window to cover them. True re-reads up to K-1 tokens the next window already holds and combine_windows weights that near-duplicate like a real window, so false is the default.
+  combine_windows: "recency_weighted"  # reduce a patient's windows to one embedding: mean | max | recency_weighted | none (none = most-recent window only)
+  time_before_event: 0      # cutoff = anchor - time_before_event (DAYS)
+  remove_cutoff_token: true # keep events with time_age < cutoff (strict: the event AT the anchor is EXCLUDED - same flag as pipelines 03/05/06); false = time_age <= cutoff (the anchor event is kept)
+  save_sequences: false     # write Sequence/Age (the full truncated history) per row. In grid mode that is ONE COPY PER STEP - a 48-step grid over a 10k-event history is ~6 MB for a single patient - so it is off by default. bow_tokens/bow_token_counts carry the same information compressed and are always written.
+
+# Column names of the MEDS input (every parquet file is checked against them at startup).
+# time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when the model was trained without Type
+
+# Column names of the anchors parquet (extraction.anchors_path)
+anchor_columns:
+  id_col: "subject_id"
+  timestamp_col: "prediction_time"   # anchor time, timestamp[us]; its time_age comes from the patient's birth
+  target_col: null         # not consumed by this pipeline

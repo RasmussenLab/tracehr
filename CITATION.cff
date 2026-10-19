@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use TracEHR in your research, please cite it as below."
+type: software
+title: "TracEHR: Autoregressive Transformer Training & Inference for Electronic Health Records"
+abstract: >-
+  TracEHR trains causal decoder (GPT-style) transformers on patients'
+  electronic health records in the MEDS format, predicting the next clinical
+  event and, optionally, its timing. The trained model is then evaluated,
+  used to generate future events, to extract patient embeddings, and to
+  predict binary, multiclass, continuous and survival outcomes by probing or
+  fine-tuning.
+authors:
+  - family-names: Aktypi
+    given-names: Foteini
+    affiliation: "Rasmussen Group, Novo Nordisk Foundation Center for Basic Metabolic Research (CBMR), University of Copenhagen"
+    orcid: "https://orcid.org/0000-0003-3209-4286"
+version: 0.1.0
+license: Apache-2.0
+repository-code: "https://github.com/fotiniak/tracehr"
+url: "https://github.com/fotiniak/tracehr"
+keywords:
+  - electronic health records
+  - EHR
+  - MEDS
+  - transformer
+  - foundation model
+  - next-event prediction
+  - time-to-event
+  - survival analysis

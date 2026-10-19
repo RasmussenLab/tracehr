@@ -1,0 +1,39 @@
+# configs/02_evaluate_model.yaml
+#
+# Held-out evaluation of a trained model: next-token test metrics, plus an optional
+# vocabulary token-embedding analysis. Downstream outcome prediction from patient
+# embeddings lives in its own pipeline (configs/05_outcome_probe_prediction.yaml).
+
+# Hardware settings
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu"
+  num_workers: 8
+  pin_memory: true
+
+# Model checkpoint
+checkpoint:
+  model_path: "data/outputs/tokens_only_ce_streaming/best_model.pt"
+  vocab_path: "data/synthetic/vocabulary.json"
+
+# Data settings
+data:
+  streaming: true  # true -> build test windows on the fly from the raw parquet (window geometry taken from the checkpoint); false -> use test_npz
+  parquet_path: "data/synthetic/meds/data" # MEDS input, a parquet file or a folder of shards (used when streaming, and by token_analysis)
+  test_ids: "data/synthetic/test_ids.parquet" # patient IDs for the test split (used when streaming)
+  test_npz: "data/synthetic/test_windows.npz" # single memory-mapped window store (used when streaming: false); must be built from the checkpoint's vocabulary with overlap_percent=0, add_final_window=False so each test token is scored once (both checked at startup)
+
+# Evaluation settings. All outputs land under output_dir: test_metrics.json (metrics +
+# model provenance), test_metrics.png, and token_embeddings/ when token_analysis is on.
+evaluation:
+  batch_size: 4
+  output_dir: "data/outputs/tokens_only_ce_streaming/evaluation/"  # Output directory for results
+  token_analysis: true  # vocabulary embedding analysis (neighbors, purity/silhouette/norm metrics, 2D map) -> <output_dir>/token_embeddings/
+  token_top_k: 10       # nearest neighbours listed per token in token_neighbors.csv
+
+# Column names of the MEDS input (every parquet file is checked against them at startup).
+# time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when the model was trained without Type; required by token_analysis

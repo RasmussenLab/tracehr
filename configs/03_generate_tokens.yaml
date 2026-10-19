@@ -1,0 +1,54 @@
+# configs/03_generate_tokens.yaml
+
+# Hardware settings
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu"
+
+# Model checkpoint
+checkpoint:
+  model_path: "data/outputs/tokens_only_ce_streaming/best_model.pt"
+
+# Data settings
+data:
+  vocab_path: "data/synthetic/vocabulary.json"
+
+# Generation settings: autoregressive rollout from anchor-truncated histories.
+# Each prediction step is logged to generations.parquet in output_dir (context seen,
+# position, predicted token, full probability distribution keyed by token string,
+# time provenance). Each step is also compared with the real event at that step of the
+# continuation right after the cutoff (true_token / true_age, correct, cum_accuracy /
+# cum_overlap; empty past the end of the record). The MEDS input is encoded on the fly.
+prediction:
+  output_dir: "data/outputs/tokens_only_ce_streaming/generation/"
+  batch_size: 64
+  num_generated_tokens: 1   # 1..20; default 1 = predict just the next position
+  raw_parquet_path: "data/synthetic/meds/data"  # MEDS input: a parquet file or a folder of shards
+  anchors_path: "data/outputs/comparisons_matched/outcomes_schizophrenia_matched.parquet"  # parquet with patient id + anchor timestamp (target column not needed)
+  time_before_event: 0      # same truncation semantics as the evaluation pipeline
+  remove_cutoff_token: true # keep events with time_age < (anchor - time_before_event)
+  allowed_token_names: null # optional list of token names as in the data, e.g. ["e11.9", "death"] (case-insensitive; quote numeric codes): restrict generated tokens to this set; names not in the vocabulary are skipped with a warning; null or [] = no restriction (probs stay full-vocab)
+
+# Optional explainability: attribute every generated token to the context it was generated
+# from. Adds attr_<method> (one signed score per context_tokens entry: the change in
+# log p(generated token), + raises / - lowers) and top_<method> (the strongest supporting
+# events as position/token/score) to generations.parquet. Slower when enabled.
+explainability:
+  enabled: false
+  methods: ["integrated_gradients", "occlusion"]  # one or both
+  n_steps: 50          # Integrated Gradients interpolation steps
+  top_k_tokens: 10     # events listed in each top_<method>
+  plot_first_k: 0      # plot every generated step of the first K patients into output_dir/explainability_plots (0 = no plots)
+
+# Column names of the MEDS input (every parquet file is checked against them at startup).
+# time_age and time_abs are computed from timestamp_col.
+columns:
+  id_col: "subject_id"     # MEDS subject_id: integer (string ids are accepted too)
+  tok_col: "code"          # MEDS code: string
+  timestamp_col: "time"    # MEDS time: timestamp[us] without a time zone; null only for sex and static tokens
+  type_col: "type"         # extra string column (not MEDS); null allowed only when the model was trained without Type
+
+# Column names of the anchors parquet (prediction.anchors_path)
+anchor_columns:
+  id_col: "subject_id"
+  timestamp_col: "prediction_time"   # anchor time, timestamp[us]; its time_age comes from the patient's birth
+  target_col: null         # not consumed by this pipeline
