@@ -40,8 +40,8 @@ class NTPTransformerConfig:
     # Age-ladder slow end. Architecture-determining and therefore pinned here: it sets the
     # Age block's frequency base, so a later edit to the module constant must not
     # silently reinterpret a checkpoint that was trained with another value. (The fast
-    # end, the T2E grid and Time2Vec's daily cycle all follow the fixed 1-minute time
-    # resolution, ntp_transformer.TIME_RESOLUTION_DAYS.)
+    # end, the T2E's same-minute interval and Time2Vec's daily cycle all follow the fixed
+    # 1-minute time resolution, ntp_transformer.TIME_RESOLUTION_DAYS.)
     # Appended (not inserted) so positional construction can never shift meaning.
     rope_time_max_days: float = 73000.0     # slowest Age wavelength (200 y)
 

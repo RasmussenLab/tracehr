@@ -3,7 +3,9 @@
 """Held-out evaluation of a trained NTPTransformer. Two jobs, both scored from the
 checkpoint alone:
   1. Next-token test metrics (loss/perplexity/accuracy/top-k/MRR, plus t2e MAE when the
-     model predicts time-to-event) over the test split -> test_metrics.json/.png
+     model predicts time-to-event) over the test split -> test_metrics.json/.png, and their
+     breakdown by target (new or repeat, same time or later) next to the context-copy and
+     unigram references -> test_metrics.json's by_target, test_metrics_by_target.png/.svg
   2. Vocabulary token-embedding analysis (optional, evaluation.token_analysis): what the
      model learned about each token -> token_embeddings/
 
@@ -21,9 +23,11 @@ from tracehr.dataset.column_mapping import enabled_col, resolve_columns
 from tracehr.dataset.meds_reader import load_event_times
 from tracehr.dataset.ntp_batching import NTPDataset, collate_fn
 from tracehr.dataset.streaming_datasets import RawStreamingNTPDataset
-from tracehr.dataset.vocabulary import vocab_fingerprint
+from tracehr.dataset.vocabulary import load_vocab, vocab_fingerprint
 from tracehr.dataset.windows import open_window_store, window_store_rescoring
-from tracehr.generation.evaluation import evaluate_model, plot_evaluation_metrics, print_metrics
+from tracehr.generation.evaluation import (TargetSplitMetrics, evaluate_model, never_target_ids,
+                                           plot_evaluation_metrics, plot_target_splits,
+                                           print_metrics, print_target_splits)
 from tracehr.generation.model_io import load_checkpoint, save_metrics
 from tracehr.training.runtime import resolve_device
 
@@ -163,11 +167,16 @@ def main(config_path: str):
     )
     print(f"Test set: {len(test_dataset)} sequences, {len(test_loader)} batches")
 
+    # The breakdown of the test metrics by target, with the context-copy and unigram references
+    stoi, _, stats = load_vocab(config["checkpoint"]["vocab_path"])
+    target_splits = TargetSplitMetrics(int(stoi["<UNK>"]), never_target_ids(stats), len(stoi))
+
     # The loss is reported with the T2E weight the model was trained with (part of its config)
     if model.t2e_pred:
         print(f"Reporting loss with trained t2e_weight={model.t2e_weight}")
     print("\nEvaluating model...")
-    metrics = evaluate_model(model, test_loader, device=device_str, show_progress=True)
+    metrics = evaluate_model(model, test_loader, device=device_str, show_progress=True,
+                             target_splits=target_splits)
 
     # Arm provenance: which model variant produced these numbers (for cross-version tables)
     mc = checkpoint.get("model_config", {})
@@ -177,15 +186,18 @@ def main(config_path: str):
         "d_model": mc.get("d_model"), "n_layers": mc.get("n_layers"),
         "shuffle_simultaneous": tc.get("data", {}).get("shuffle_simultaneous", False),
     }
+    metrics["by_target"] = target_splits.result()
 
     # Print results
     print_metrics(metrics)
+    print_target_splits(metrics["by_target"])
 
     # Save metrics
     save_metrics(metrics, output_dir / "test_metrics.json")
 
     # Create plots
     plot_evaluation_metrics(metrics, str(output_dir / "test_metrics.png"))
+    plot_target_splits(metrics["by_target"], output_dir / "test_metrics_by_target")
 
     # ── Vocabulary token-embedding analysis (optional) ────────────────────────
     # What the model learned about each vocabulary token, read straight off the token

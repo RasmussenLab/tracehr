@@ -10,11 +10,13 @@ aggregate queries (token_type_counts, count_rows), the ordered per-patient strea
 (stream_patient_sequences returns raw tokens and types, stream_encoded_patient_sequences
 encodes them in SQL) and a random-access reader (PatientEventReader). Every path sorts a
 patient's events by canonical_order, so streamed windows are byte-identical to the
-window-store build.
+window-store build. Every DuckDB connection is opened by connect(): the run's memory limit,
+the job's CPUs and a spill folder of its own.
 """
 
 import glob
 import os
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +25,8 @@ from functools import cached_property
 import duckdb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
+from torch.utils.data import get_worker_info
 
 # time_abs counts days from this moment; births before it are dropped, so no event has a
 # negative time_abs. A new vocabulary records this value, and every later run uses the
@@ -87,7 +91,7 @@ def parquet_id_class(parquet_path, id_col):
     """Classify a parquet id column as 'numeric', 'string', or None by reading the
     schema (DESCRIBE is metadata-only, no row scan). Lets a Python-dict join give the
     same loud type check DuckDB's own id filter already raises on."""
-    con = duckdb.connect()
+    con = connect()
     try:
         desc = con.execute(
             f'DESCRIBE SELECT "{id_col}" FROM {_duck_source(parquet_path)}').fetchall()
@@ -198,6 +202,7 @@ class EventTimes:
     birth_token: str                    # normalized, as the vocabulary records it
     preamble_tokens: tuple[str, ...]    # the vocabulary's sex and static tokens, normalized
     origin_us: int                      # the vocabulary's EARLIEST_TIMESTAMP, as to_us()
+    file_paths: tuple[str, ...]         # parquet_files of the input; births' file_index points here
 
     @cached_property
     def _birth_index(self):
@@ -214,11 +219,33 @@ class EventTimes:
             return self.births.slice(int(order[i]), 1)
         return self.births.slice(0, 0)
 
+    def births_by_file(self, ids=None):
+        """(file path, births of these patients in that file) for each input file holding one
+        of them, in file order; ids None means every kept patient. A MEDS file holds each of its
+        patients whole (check_patients makes sure), so a reader can sort one file at a time."""
+        births = self.births
+        if ids is not None:
+            have = births.column(self.id_col).to_numpy(zero_copy_only=False)
+            births = births.filter(pa.array(np.isin(have, np.asarray(list(ids)))))
+        index = births.column("file_index").to_numpy()
+        order = np.argsort(index, kind="stable")
+        bounds = np.searchsorted(index[order], np.arange(len(self.file_paths) + 1))
+        for i, path in enumerate(self.file_paths):
+            if bounds[i] < bounds[i + 1]:
+                yield path, births.take(pa.array(order[bounds[i]:bounds[i + 1]]))
+
+    def file_of(self, pid) -> str:
+        """The input file holding this patient (the first file for a patient not kept, whose
+        read is then empty)."""
+        row = self.birth_row(pid)
+        return self.file_paths[row.column("file_index")[0].as_py() if row.num_rows else 0]
+
 
 def check_patients(parquet_path, cols, birth, sex, static, origin_us):
     """The checks behind load_event_times, without its report: which patients the readers
     keep. birth, sex and static are the normalized birth, sex and static token names,
-    origin_us the time origin (to_us). Pipeline 01's vocabulary build calls it with the
+    origin_us the time origin (to_us). Raises when a patient has rows in more than one
+    input file (_patient_files). Pipeline 01's vocabulary build calls it with the
     config's values, before any vocabulary exists; load_event_times with the vocabulary's.
 
     Returns (event_times, per_patient, counts). per_patient has one row per patient with an
@@ -226,7 +253,7 @@ def check_patients(parquet_path, cols, birth, sex, static, origin_us):
     flags r0..r4 (no birth row; birth rows without a timestamp; birth rows at different
     timestamps; a birth before the origin; a real event before the birth) and kept.
     counts = (rows, rows without an id, rows without a token) of the whole input.
-    event_times joins the kept patients only. Two queries over the input.
+    event_times joins the kept patients only. Two queries over the input, three for a folder.
     """
     id_col, tok_col, ts_col = cols["id_col"], cols["tok_col"], cols["timestamp_col"]
     source = _duck_source(parquet_path)
@@ -234,8 +261,9 @@ def check_patients(parquet_path, cols, birth, sex, static, origin_us):
     is_birth = f"norm = {_sql_str(birth)}"
     is_sex, is_static = sql_in("norm", sex), sql_in("norm", static)
     real = f"NOT ({is_birth}) AND NOT ({is_sex}) AND NOT ({is_static})"
-    con = duckdb.connect()
+    con = connect()
     try:
+        patient_files = _patient_files(con, source, id_col, parquet_path)
         counts = con.execute(
             f'SELECT COUNT(*), COUNT(*) FILTER (WHERE "{id_col}" IS NULL), '
             f'COUNT(*) FILTER (WHERE "{id_col}" IS NOT NULL AND {tok} IS NULL) FROM {source}').fetchone()
@@ -261,11 +289,83 @@ def check_patients(parquet_path, cols, birth, sex, static, origin_us):
     is_bad = np.logical_or.reduce(flags) if per_patient.num_rows else np.zeros(0, dtype=bool)
     per_patient = per_patient.append_column("kept", pa.array(~is_bad))
     kept = per_patient.filter(pa.array(~is_bad))
+    if patient_files is None:
+        file_index = pa.array(np.zeros(kept.num_rows, dtype=np.int64))
+    else:
+        file_index = patient_files["file_index"].take(
+            pc.index_in(kept["pid"], value_set=patient_files["pid"]))
     event_times = EventTimes(id_col=id_col, timestamp_col=ts_col,
-                             births=pa.table({id_col: kept["pid"], "birth_us": kept["birth_us"]}),
+                             births=pa.table({id_col: kept["pid"], "birth_us": kept["birth_us"],
+                                              "file_index": file_index}),
                              birth_token=birth, preamble_tokens=tuple(sorted(set(sex) | set(static))),
-                             origin_us=origin_us)
+                             origin_us=origin_us, file_paths=tuple(parquet_files(parquet_path)))
     return event_times, per_patient, counts
+
+
+def _patient_files(con, source, id_col, parquet_path) -> pa.Table | None:
+    """Each patient id's input file, as (pid, file_index): file_index is DuckDB's, a row's
+    position in parquet_files. None for a single file. Every row with an id counts.
+
+    Raises when a patient id has rows in more than one file: MEDS keeps each subject in one
+    file, and the readers sort one file at a time, so a split patient would silently lose rows.
+    A data column named file_index would hide DuckDB's own, so it is refused first. A query of
+    its own: in check_patients' per-patient query the two columns raised the peak memory.
+    """
+    if len(parquet_files(parquet_path)) == 1:
+        return None
+    names = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall()]
+    if "file_index" in names:
+        raise ValueError(
+            f"The input {parquet_path} has a column named file_index. tracehr checks that every "
+            f"patient is in one file with DuckDB's built-in file_index (the number of the file a row "
+            f"comes from), and a data column of that name hides it: the check would read your column "
+            f"instead and could miss a patient split across files. Rename or drop that column, then "
+            f"run again.")
+    files = con.execute(
+        f'SELECT "{id_col}" AS pid, MIN(file_index) AS file_index, MAX(file_index) AS last_file '
+        f'FROM {source} WHERE "{id_col}" IS NOT NULL GROUP BY 1').to_arrow_table()
+    split = files.filter(pc.not_equal(files["file_index"], files["last_file"]))
+    if split.num_rows:
+        raise ValueError(_split_patients_message(con, source, id_col, parquet_path,
+                                                 split["pid"].to_pylist()))
+    return files.select(["pid", "file_index"])
+
+
+def _split_patients_message(con, source, id_col, parquet_path, pids, shown=5, files_shown=3) -> str:
+    """The error for patients with rows in more than one file: how many, and for the first
+    few (sorted, so the message is the same on every run) their files and rows in each."""
+    pids = sorted(pids)
+    files = parquet_files(parquet_path)
+    root = parquet_path if os.path.isdir(str(parquet_path)) else os.path.dirname(str(parquet_path))
+    con.register("_split", pa.table({"pid": pids[:shown]}))
+    rows = con.execute(
+        f'SELECT "{id_col}", file_index, COUNT(*) FROM {source} '
+        f'WHERE "{id_col}" IN (SELECT pid FROM _split) GROUP BY 1, 2 ORDER BY 1, 2').fetchall()
+    where = {}
+    for pid, i, n in rows:
+        rows_in = f"{n:,} row{'s' if n != 1 else ''} in {os.path.relpath(files[int(i)], root)}"
+        where.setdefault(pid, []).append(rows_in)
+    lines = []
+    for pid in pids[:shown]:
+        more = len(where[pid]) - files_shown
+        lines.append(f"  patient {pid!r}: {len(where[pid])} files, " + ", ".join(where[pid][:files_shown])
+                     + (f" and {more} more file{'s' if more != 1 else ''}" if more > 0 else ""))
+    if len(pids) > shown:
+        lines.append(f"  ... and {len(pids) - shown:,} more patient{'s' if len(pids) - shown != 1 else ''}")
+    who = "1 patient has" if len(pids) == 1 else f"{len(pids):,} patients have"
+    return (
+        f"The input breaks the MEDS rule that all data of a patient is in one file.\n"
+        f"{who} rows (patient id column {id_col!r}) in more than one parquet file under {root}:\n"
+        + "\n".join(lines) + "\n"
+        f"MEDS requires subject contiguity: the data of one subject must not be split across multiple "
+        f"parquet files. Each patient id must therefore be in exactly one file of the whole input, "
+        f"counting the train, tuning and held_out folders together.\n"
+        f"tracehr relies on this rule: it reads, sorts and windows each file on its own, so a patient "
+        f"whose rows are split would be read with part of their history missing, without any other "
+        f"error. The run stops here, at the input check, before anything is computed.\n"
+        f"To fix it, put all rows of each of these patient ids into one file (for example, by "
+        f"re-sharding the data with the MEDS tools), or, if different people share an id across "
+        f"files, give them distinct ids. Then run again.")
 
 
 def load_event_times(parquet_path, cols, vocab_path) -> EventTimes:
@@ -348,10 +448,12 @@ def load_event_times(parquet_path, cols, vocab_path) -> EventTimes:
     return event_times
 
 
-def event_source(con, parquet_path, event_times, id_col, tok_col, type_col, pid=None) -> str:
+def event_source(con, parquet_path, event_times, id_col, tok_col, type_col, pid=None,
+                 births=None) -> str:
     """What every reader selects FROM: the input joined to the births (pid narrows them to
-    one patient for a per-patient fetch), with time_age and time_abs computed from the
-    timestamp under the names AGE_COL and ABS_COL, plus the id, token and type columns.
+    one patient for a per-patient fetch; births, to these rows of event_times.births), with
+    time_age and time_abs computed from the timestamp under the names AGE_COL and ABS_COL,
+    plus the id, token and type columns.
 
     Birth rows are left out (the clock origin only), and so are rows without a token and rows
     with a null timestamp that are not sex or static tokens. Sex and static tokens take the
@@ -359,7 +461,9 @@ def event_source(con, parquet_path, event_times, id_col, tok_col, type_col, pid=
     """
     if event_times is None:
         raise ValueError("Every reader needs the run's event_times (load_event_times).")
-    con.register("_births", event_times.births if pid is None else event_times.birth_row(pid))
+    if births is None:
+        births = event_times.births if pid is None else event_times.birth_row(pid)
+    con.register("_births", births)
     keep = ", ".join(f'e."{c}"' for c in (id_col, tok_col, type_col) if c is not None)
     ts_col = event_times.timestamp_col
     is_pre = sql_in("e._tracehr_norm", event_times.preamble_tokens)
@@ -381,7 +485,7 @@ def token_type_counts(parquet_path, tok_col, type_col, event_times):
     event_times), for per-token frequency + modal-type stats without materialising the
     rows: no birth rows, rows without a token, untimed rows that are not sex or static
     tokens, or rows of dropped patients."""
-    con = duckdb.connect()
+    con = connect()
     try:
         source = event_source(con, parquet_path, event_times, event_times.id_col, tok_col, type_col)
         return con.execute(
@@ -393,7 +497,7 @@ def token_type_counts(parquet_path, tok_col, type_col, event_times):
 
 def count_rows(parquet_path, event_times, id_col, tok_col, ids) -> tuple[int, int]:
     """(patients, rows) the readers would read for these patient ids."""
-    con = duckdb.connect()
+    con = connect()
     try:
         source = event_source(con, parquet_path, event_times, id_col, tok_col, None)
         where = register_ids(con, ids, id_col)
@@ -456,7 +560,8 @@ def _iter_patient_groups(con, sql, cols, id_col, batch_rows):
     several sequences - a corruption no downstream stage could detect.
     """
     cur_pid, parts = None, None
-    for batch in con.execute(sql).to_arrow_reader(batch_rows):
+    # con.sql streams; con.execute(...).to_arrow_reader copies the whole result first in DuckDB 2
+    for batch in con.sql(sql).to_arrow_reader(batch_rows):
         col_np = {c: batch.column(c).to_numpy(zero_copy_only=False) for c in cols}
         pid_col = col_np[id_col]
         n = len(pid_col)
@@ -488,46 +593,92 @@ def _iter_patient_groups(con, sql, cols, id_col, batch_rows):
 # Units DuckDB prints a memory setting in: current_setting('memory_limit') -> e.g. "25.5 GiB"
 _MEMORY_UNITS = {"bytes": 1, "KiB": 2 ** 10, "MiB": 2 ** 20, "GiB": 2 ** 30, "TiB": 2 ** 40,
                  "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12}
+# Every connection spills into a folder of its own under this one (see connect)
+SPILL_ROOT = ".tmp_tracehr"
 
 
-def duckdb_default_memory_limit() -> int | None:
-    """DuckDB's default memory_limit in bytes: 80% of the memory this process may use, which
-    DuckDB takes as the smallest of the RAM, a SLURM allocation (SLURM_MEM_PER_NODE /
-    SLURM_MEM_PER_CPU) and the process's cgroup limit (a SLURM job's or a container's). None
-    when DuckDB reports it in a form not recognised here."""
-    con = duckdb.connect()
-    try:
-        text = str(con.execute("SELECT current_setting('memory_limit')").fetchone()[0])
-    finally:
-        con.close()
-    number, _, unit = text.strip().partition(" ")
+def _memory_bytes(text) -> int | None:
+    """A DuckDB memory setting as printed ("25.5 GiB") in bytes; None in another form."""
+    number, _, unit = str(text).strip().partition(" ")
     try:
         return int(float(number) * _MEMORY_UNITS[unit])
     except (KeyError, ValueError):
         return None
 
 
+def _cpu_count(duckdb_threads: int) -> int:
+    """The CPUs this job may use: the smallest of DuckDB's own count (which follows a cgroup CPU
+    quota), the CPUs this process may run on (taskset, cpusets) and a PBS job's cores
+    (PBS_NUM_PPN, NCPUS), which DuckDB cannot see."""
+    counts = [duckdb_threads]
+    if hasattr(os, "sched_getaffinity"):
+        counts.append(len(os.sched_getaffinity(0)))
+    counts += [int(os.environ[v]) for v in ("PBS_NUM_PPN", "NCPUS") if os.environ.get(v, "").isdigit()]
+    return max(1, min(counts))
+
+
+def connect():
+    """A DuckDB connection: DuckDB's default memory limit (80% of the RAM, or of a Slurm
+    allocation or container limit; on PBS, set SLURM_MEM_PER_NODE in the job script) and the
+    job's CPUs, both divided equally between the DataLoader workers when opened in one, and a
+    spill folder of its own, so concurrent queries never share a spill file.
+
+    The folder is SPILL_ROOT/<random id> in the working folder: DuckDB creates it at the first
+    spill and removes it when the connection closes. A killed run leaves it behind (see
+    _report_settings)."""
+    root = os.path.abspath(SPILL_ROOT)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError:
+        pass  # a read-only working folder only matters if a query spills
+    con = duckdb.connect(config={"temp_directory": os.path.join(root, uuid.uuid4().hex)})
+    worker = get_worker_info()
+    n = worker.num_workers if worker is not None else 1
+    cpus = _cpu_count(int(con.execute("SELECT current_setting('threads')").fetchone()[0]))
+    con.execute(f"SET threads = {max(1, cpus // n)}")
+    if n > 1:
+        total = _memory_bytes(con.execute("SELECT current_setting('memory_limit')").fetchone()[0])
+        if total is not None:
+            con.execute(f"SET memory_limit = '{total // n // 2 ** 20}MiB'")
+    if worker is None:
+        _report_settings(con, root, cpus)
+    return con
+
+
+def _report_settings(con, root, cpus) -> None:
+    """Print, once per run, the memory limit, the CPUs and the spill folder, and warn about
+    spill folders already there: a killed run's (or a running job's), which nothing removes."""
+    if "duckdb" in _WARNED:
+        return
+    _WARNED.add("duckdb")
+    memory = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    print(f"[duckdb] memory limit {memory} and {cpus} CPUs, both shared equally by the "
+          f"DataLoader workers; spill in {root}")
+    left = [e.path for e in os.scandir(root) if e.is_dir()] if os.path.isdir(root) else []
+    if left:
+        size = sum(os.path.getsize(os.path.join(d, f)) for p in left for d, _, fs in os.walk(p) for f in fs)
+        print(f"[duckdb] WARNING: {root} holds {len(left)} folder(s) ({size / 1e9:.1f} GB) from a killed "
+              f"run or a job still running here; delete them by hand once no job runs in this folder.")
+
+
 def stream_patient_sequences(parquet_path, id_col, tok_col, time_age_col,
                              time_abs_col, type_col, ids=None, batch_rows=131072,
-                             event_times=None, memory_limit=None):
-    """Yield (pid, toks, age, abs, typ) per patient, streaming the parquet ordered
-    by (id, age, tok). One out-of-core DuckDB scan; only the current patient plus
-    one Arrow batch are resident. Tokens/types are raw (caller encodes). event_times
-    (load_event_times) leaves out the dropped rows and patients and computes the times.
-    memory_limit (e.g. "4096MB") caps this connection, beyond which the sort spills to
-    disk; None keeps DuckDB's default."""
+                             event_times=None):
+    """Yield (pid, toks, age, abs, typ) per patient, one input file after the other, each
+    file's patients ordered by (id, age, tok). One out-of-core DuckDB sort per file; only the
+    current patient plus one Arrow batch are resident. Tokens/types are raw (caller encodes).
+    event_times (load_event_times) names the files (parquet_path's), leaves out the dropped
+    rows and patients and computes the times."""
     cols = _select_cols(id_col, tok_col, time_age_col, time_abs_col, type_col)
-    con = duckdb.connect()
+    con = connect()
     try:
-        if memory_limit:
-            con.execute(f"SET memory_limit = '{memory_limit}'")
-        source = event_source(con, parquet_path, event_times, id_col, tok_col, type_col)
-        where = register_ids(con, ids, id_col)
         select = ", ".join(f'"{c}"' for c in cols)
         order = f'"{id_col}", "{time_age_col}", "{tok_col}"'
-        sql = f"SELECT {select} FROM {source} AS e{where} ORDER BY {order}"
-        for pid, parts in _iter_patient_groups(con, sql, cols, id_col, batch_rows):
-            yield (pid, *_finish(parts, tok_col, time_age_col, time_abs_col, type_col))
+        for path, births in event_times.births_by_file(ids):
+            source = event_source(con, path, event_times, id_col, tok_col, type_col, births=births)
+            sql = f"SELECT {select} FROM {source} AS e ORDER BY {order}"
+            for pid, parts in _iter_patient_groups(con, sql, cols, id_col, batch_rows):
+                yield (pid, *_finish(parts, tok_col, time_age_col, time_abs_col, type_col))
     finally:
         con.close()
 
@@ -550,11 +701,11 @@ def stream_encoded_patient_sequences(
     contract as StreamingAnchorsDataset._truncate.
 
     Rows arrive grouped by patient but NOT ordered within a patient; the caller applies
-    canonical_order, exactly as the raw stream's callers already do.
+    canonical_order, exactly as the raw stream's callers already do. Patients come one input
+    file after the other, in id order within a file.
     """
-    con = duckdb.connect()
+    con = connect()
     try:
-        source = event_source(con, parquet_path, event_times, id_col, tok_col, type_col)
         _register_lookup(con, "_vocab", stoi, "token", "tid")
         tok_ref = f'e."{tok_col}"'
         joins = [f'LEFT JOIN _vocab v ON {normalized_sql(tok_ref)} = v.token']
@@ -574,7 +725,6 @@ def stream_encoded_patient_sequences(
             select.append("COALESCE(t.tyid, 0)::INTEGER AS typ")
             out_cols.append("typ")
 
-        where = ""
         if anchors is not None:
             op = "<" if remove_cutoff_token else "<="
             con.register("_anchors", pa.table({
@@ -583,9 +733,6 @@ def stream_encoded_patient_sequences(
             }))
             joins.append(f'JOIN _anchors a ON e."{id_col}" = a."{id_col}" '
                          f'AND e."{time_age_col}" {op} a.cutoff')
-        if ids is not None:
-            con.register("_ids", pa.table({id_col: pa.array(list(ids))}))
-            where = f' WHERE e."{id_col}" IN (SELECT "{id_col}" FROM _ids)'
 
         # Only ORDER BY id: the per-patient (age, token) order is redone by canonical_order,
         # so carrying those keys through an external sort of the whole table is dead work.
@@ -593,17 +740,20 @@ def stream_encoded_patient_sequences(
         # preserve the scan order across the vocabulary/type/anchor hash joins above, so the
         # rows of one patient would arrive in several disjoint runs. It costs almost nothing
         # here because it sorts what survives the anchor join (the cohort), not the table.
-        sql = (f'SELECT {", ".join(select)} FROM {source} AS e '
-               f'{" ".join(joins)}{where} ORDER BY e."{id_col}"')
-
-        for pid, parts in _iter_patient_groups(con, sql, out_cols, "pid", batch_rows):
-            toks = np.concatenate(parts["tok"]).astype(np.int32, copy=False)
-            age = np.concatenate(parts["age"]).astype(np.float64, copy=False)  # float64: see _finish
-            absv = (np.concatenate(parts["abs"]).astype(np.float64, copy=False)
-                    if time_abs_col is not None else None)
-            typ = (np.concatenate(parts["typ"]).astype(np.int32, copy=False)
-                   if type_col is not None else None)
-            yield pid, toks, age, absv, typ
+        # One file at a time, with only the wanted patients' births (ids, else the anchored
+        # ones), so a file without one of them is never read.
+        for path, births in event_times.births_by_file(ids if ids is not None else anchors):
+            source = event_source(con, path, event_times, id_col, tok_col, type_col, births=births)
+            sql = (f'SELECT {", ".join(select)} FROM {source} AS e '
+                   f'{" ".join(joins)} ORDER BY e."{id_col}"')
+            for pid, parts in _iter_patient_groups(con, sql, out_cols, "pid", batch_rows):
+                toks = np.concatenate(parts["tok"]).astype(np.int32, copy=False)
+                age = np.concatenate(parts["age"]).astype(np.float64, copy=False)  # float64: see _finish
+                absv = (np.concatenate(parts["abs"]).astype(np.float64, copy=False)
+                        if time_abs_col is not None else None)
+                typ = (np.concatenate(parts["typ"]).astype(np.int32, copy=False)
+                       if type_col is not None else None)
+                yield pid, toks, age, absv, typ
     finally:
         con.close()
 
@@ -633,7 +783,7 @@ class PatientEventReader:
         """This process's connection: duckdb connections are not fork-safe, so a new one is
         opened when the process changes (DataLoader workers)."""
         if self._con is None or self._pid_owner != os.getpid():
-            self._con = duckdb.connect()
+            self._con = connect()
             self._pid_owner = os.getpid()
         return self._con
 
@@ -643,7 +793,7 @@ class PatientEventReader:
             self._cache.move_to_end(pid)
             return self._cache[pid]
         con = self._conn()
-        source = event_source(con, self.parquet_path, self.event_times, self.id_col,
+        source = event_source(con, self.event_times.file_of(pid), self.event_times, self.id_col,
                                self.tok_col, self.type_col, pid=pid)
         select = ", ".join(f'"{c}"' for c in self.cols)
         sql = (f'SELECT {select} FROM {source} '

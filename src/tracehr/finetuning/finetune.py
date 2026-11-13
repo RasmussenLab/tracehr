@@ -1,6 +1,7 @@
 # src/tracehr/finetuning/finetune.py
 """The outcome finetuning loop of pipeline 06: training, validation on the task's monitored
-metric, checkpoints, resume, the two-phase LP-FT switch, early stopping and the loss plots."""
+metric, checkpoints, resume, the two-phase LP-FT switch, early stopping and the training-curve
+plots."""
 
 import json
 import math
@@ -14,14 +15,14 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from ..generation.model_io import check_vocab_fingerprint, json_safe
-from ..training.plots import plot_all_batch_losses, plot_epoch_metric
+from ..training.plots import plot_all_batch_losses
 from ..training.runtime import (
     ProgressLog,
     batch_to_device,
     prune_epoch_checkpoints,
     resolve_device,
 )
-from .finetune_plots import plot_finetune_batch_losses, plot_finetune_losses
+from .finetune_plots import plot_training_curves
 from .outcome_evaluation import evaluate_outcome
 
 # Per-task validation metric to monitor for best-checkpoint / early stopping.
@@ -226,13 +227,15 @@ def _validate_epoch(model, val_loader: DataLoader, state: _RunState, *, device,
     return val_metrics, val_score
 
 
-def _save_epoch(state: _RunState, model, val_metrics: dict, val_score: float,
-                batch_losses: list[float], *, epoch: int, output_dir: Path, save_every: int,
-                keep_last_n: int, vocab_fingerprint: str | None, config: dict | None) -> None:
+def _save_epoch(state: _RunState, model, val_metrics: dict, val_score: float, *, epoch: int,
+                output_dir: Path, save_every: int, keep_last_n: int,
+                vocab_fingerprint: str | None, config: dict | None,
+                unfreeze_after_epochs: int | None) -> None:
     """One epoch's checkpoints, history and plots in output_dir: best_model.pt and a reset of
     the patience counter on an improvement (else one more epoch of patience used), latest.pt,
     every save_every-th epoch an epoch_N.pt (keeping the last keep_last_n),
-    training_history.json and the loss, val-score and batch-loss plots."""
+    training_history.json, the training curves (unfreeze_after_epochs marks the two-phase
+    switch) and the plot of every batch loss."""
     if state.is_better(val_score, state.best_score):
         state.best_score = val_score
         state.patience_counter = 0
@@ -270,11 +273,8 @@ def _save_epoch(state: _RunState, model, val_metrics: dict, val_score: float,
     with open(output_dir / "training_history.json", "w") as f:
         json.dump(json_safe(history), f, indent=2)
 
-    plot_finetune_losses(history["train_loss"], history["val_loss"], str(output_dir / "loss_plot.png"))
-    plot_epoch_metric(history["val_score"], str(output_dir / "val_score_plot.png"),
-                      label=f"Val {state.monitor_key}", ylabel=state.monitor_key,
-                      title=f"Validation {state.monitor_key} Across Epochs", color="royalblue")
-    plot_finetune_batch_losses(batch_losses, epoch + 1, str(output_dir / f"batch_losses_epoch_{epoch+1}.png"))
+    plot_training_curves(history, state.monitor_key, unfreeze_after_epochs,
+                         output_dir / "training_curves")
     plot_all_batch_losses(history["all_batch_losses"], str(output_dir / "all_batch_losses.png"),
                           title="Fine-tuning Loss per Batch (All Epochs)",
                           epoch_labels="legend", announce=False)
@@ -377,9 +377,10 @@ def finetune(
               f"Val Loss: {val_metrics['loss']:.4f} | Val {state.monitor_key}: {val_score:.4f}")
 
         if output_dir:
-            _save_epoch(state, model, val_metrics, val_score, batch_losses, epoch=epoch,
+            _save_epoch(state, model, val_metrics, val_score, epoch=epoch,
                         output_dir=output_dir, save_every=save_every, keep_last_n=keep_last_n,
-                        vocab_fingerprint=vocab_fingerprint, config=config)
+                        vocab_fingerprint=vocab_fingerprint, config=config,
+                        unfreeze_after_epochs=unfreeze_after_epochs)
 
         if state.patience_counter >= early_stopping_patience:
             print(f"Early stopping after {epoch+1} epochs (no {state.monitor_key} improvement for {early_stopping_patience} epochs)")

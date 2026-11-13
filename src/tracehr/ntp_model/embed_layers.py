@@ -22,7 +22,9 @@ T2V_DAILY_PERIOD_DAYS = 1.0     # daily cycle: exactly the time of day on absTim
 
 
 class TokenEmbedding(nn.Module):
-    """Token ids -> d_model vectors; the <PAD> row is zero and receives no gradient."""
+    """Token ids -> d_model vectors. The <PAD> row starts at zero and the lookup sends it no
+    gradient, but the scorer tied to this table (every objective) still trains it, so after
+    training it is not zero."""
 
     def __init__(self, vocab_size: int, d_model: int, pad_id: int = 0):
         """The table is the attribute `emb`, so it is never confused with a tensor .weight."""

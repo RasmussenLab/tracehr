@@ -31,8 +31,11 @@ training rows for exactly that many rounds. The scored booster therefore holds p
 the tuned number of trees, which makes iteration_range unnecessary rather than merely
 optional, and no scored row ever influenced its own stopping point.
 
-It costs one extra fit per fold, but the second fit runs the tuned count (typically tens
-of rounds) rather than the full num_boost_round, so the added time is well under 2x.
+The count is chosen by an inner cross-validation over the fold's training rows, not by
+one holdout: on a few hundred patients a single 20% holdout is so noisy that the count
+swung between 1 and 40 rounds from fold to fold, and the refit (their median) could ship
+a 4-tree model. Averaging the inner folds steadies it. It costs one fit per inner fold,
+each stopped early_stopping_rounds past the peak, plus the final fit.
 """
 
 from collections.abc import Callable, Iterable, Sequence
@@ -40,12 +43,49 @@ from collections.abc import Callable, Iterable, Sequence
 import numpy as np
 import xgboost as xgb
 from sklearn.base import clone
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
-# Below this many training rows a 20% holdout is too small to stop on; the fold then trains
-# the full num_boost_round, which is at least honest - nothing is tuned on the scored rows.
-_MIN_ROWS_FOR_HOLDOUT = 20
+# The inner cross-validation that chooses each fold's round count uses this many folds, fewer
+# when the scarcer label or the patient count cannot fill them (_inner_folds).
+_INNER_FOLDS = 5
+# Below this many training rows there is too little to tune on; the fold then trains the full
+# num_boost_round, which is at least honest - nothing is tuned on the scored rows.
+_MIN_ROWS_TO_TUNE = 20
+
+
+def _inner_folds(n: int, stratify: np.ndarray | None, groups: np.ndarray | None,
+                 random_state: int) -> list | None:
+    """The (train, test) index pairs of fit_with_tuned_rounds' inner cross-validation over n
+    rows, or None when there is too little to tune on.
+
+    The splitter matches the outer folds: stratified on `stratify` when given, grouped by
+    `groups` (patient ids) when given, so no patient sits on both sides of an inner fold.
+    A stratified split must put every label in every fold: xgb.cv averages the folds'
+    scores, and one fold without both classes (AUROC) or without an event (Cox) turns the
+    mean into NaN, which early-stops at round 1 without a word. So the fold count starts at
+    _INNER_FOLDS, capped by the scarcer label's patient count, and is lowered until every
+    fold holds every label. A single label leaves nothing to stratify on - None.
+    """
+    if n < _MIN_ROWS_TO_TUNE:
+        return None
+    units = groups if groups is not None else np.arange(n)
+    if stratify is None:
+        k = min(_INNER_FOLDS, len(np.unique(units)))
+        splitter = GroupKFold if groups is not None else KFold
+        return (list(splitter(n_splits=k, shuffle=True, random_state=random_state)
+                     .split(np.zeros(n), None, groups)) if k >= 2 else None)
+    labels = np.unique(stratify)
+    if len(labels) < 2:
+        return None
+    splitter = StratifiedGroupKFold if groups is not None else StratifiedKFold
+    k_max = min([_INNER_FOLDS] + [len(np.unique(units[stratify == v])) for v in labels])
+    for k in range(k_max, 1, -1):
+        folds = list(splitter(n_splits=k, shuffle=True, random_state=random_state)
+                     .split(np.zeros(n), stratify, groups))
+        if all(np.isin(labels, stratify[test]).all() for _, test in folds):
+            return folds
+    return None
 
 
 def fit_with_tuned_rounds(
@@ -53,49 +93,33 @@ def fit_with_tuned_rounds(
     X,
     label: np.ndarray,
     *,
-    num_boost_round: int = 300,
-    early_stopping_rounds: int = 20,
+    num_boost_round: int = 2000,
+    early_stopping_rounds: int = 30,
     random_state: int = 42,
     stratify: np.ndarray | None = None,
-    holdout_frac: float = 0.2,
+    groups: np.ndarray | None = None,
 ) -> tuple[xgb.Booster, int]:
-    """Train on all of (X, label) for a round count tuned on an inner holdout.
+    """Train on all of (X, label) for a round count tuned by an inner cross-validation.
 
     Returns (booster, n_rounds). The booster holds exactly n_rounds trees, so a plain
     predict() on it is the tuned model - no iteration_range needed.
 
     `label` is what goes into the DMatrix (for survival that is the signed duration);
-    `stratify` is what the inner split balances on (the class label, or the event
-    indicator), which is a different array for survival and None for regression. A
-    stratified split that cannot be made - a class with a single member - silently falls
-    back to an unstratified one rather than failing the whole run.
+    `stratify` is what the inner folds balance on (the class label, or the event
+    indicator), which is a different array for survival and None for regression; `groups`
+    (patient ids, or None) keeps each patient inside one inner fold (_inner_folds). The
+    count is the round where the inner folds' mean score peaked - xgb.cv cuts its history
+    there when early stopping fires - or num_boost_round when the budget runs out first.
     """
-    n = X.shape[0]
-    fit_idx = stop_idx = None
-    if n >= _MIN_ROWS_FOR_HOLDOUT:
-        idx = np.arange(n)
-        for strat in (stratify, None):
-            try:
-                fit_idx, stop_idx = train_test_split(
-                    idx, test_size=holdout_frac, random_state=random_state, stratify=strat)
-                break
-            except ValueError:
-                fit_idx = stop_idx = None
-
+    dtrain = xgb.DMatrix(X, label=label)
     rounds = num_boost_round
-    if fit_idx is not None and len(stop_idx) >= 2:
-        probe = xgb.train(
-            params, xgb.DMatrix(X[fit_idx], label=label[fit_idx]),
-            num_boost_round=num_boost_round,
-            evals=[(xgb.DMatrix(X[stop_idx], label=label[stop_idx]), "stop")],
-            early_stopping_rounds=early_stopping_rounds, verbose_eval=False)
-        # best_iteration is a 0-based index; +1 is the number of trees to keep. The old
-        # code fed the index straight to the refit, so the shipped model was one tree
-        # short of the one early stopping actually chose.
-        rounds = int(probe.best_iteration) + 1
+    folds = _inner_folds(X.shape[0], stratify, groups, random_state)
+    if folds is not None:
+        history = xgb.cv(params, dtrain, num_boost_round=num_boost_round, folds=folds,
+                         early_stopping_rounds=early_stopping_rounds, verbose_eval=False)
+        rounds = len(history)
 
-    booster = xgb.train(params, xgb.DMatrix(X, label=label), num_boost_round=rounds,
-                        verbose_eval=False)
+    booster = xgb.train(params, dtrain, num_boost_round=rounds, verbose_eval=False)
     return booster, rounds
 
 
@@ -186,13 +210,15 @@ def cross_validate_xgboost(
     num_boost_round: int,
     early_stopping_rounds: int,
     random_state: int,
+    groups: np.ndarray | None = None,
 ) -> tuple[xgb.Booster, dict[str, list[float]]]:
     """Cross-validate XGBoost, then refit it on all rows for the median tuned round count.
 
     labels is what goes into the DMatrix (the signed duration for survival, else y); y is
-    what fold_metrics scores against; stratify is what each fold's inner early-stopping
-    split balances on (or None). Each fold trains with fit_with_tuned_rounds, so no scored
-    row ever chooses its own stopping point. The refit round count is floored at 1: a median
+    what fold_metrics scores against; stratify is what each fold's inner cross-validation
+    balances on (or None) and groups (patient ids, or None) what it keeps together. Each
+    fold trains with fit_with_tuned_rounds, so no scored row ever chooses its own stopping
+    point. The refit round count is floored at 1: a median
     of 0 would build a tree-less booster that predicts a constant and crashes SHAP's
     TreeExplainer. Returns (booster, {metric: [one value per fold]}). The caller prints the
     header (print_cv_header) and prepares params first.
@@ -206,13 +232,14 @@ def cross_validate_xgboost(
 
         dval = xgb.DMatrix(X_v, label=labels[val_idx])
 
-        # The round count is tuned on a holdout inside THIS fold's training rows, then the
-        # booster is trained on all of them for exactly that many rounds - see the header
-        # for what early-stopping on the scored fold silently did to these numbers instead.
+        # The round count is tuned by an inner cross-validation over THIS fold's training
+        # rows, then the booster is trained on all of them for exactly that many rounds -
+        # see the header for what early-stopping on the scored fold silently did instead.
         bst, rounds = fit_with_tuned_rounds(
             params, X_tr, labels[train_idx], num_boost_round=num_boost_round,
             early_stopping_rounds=early_stopping_rounds, random_state=random_state,
-            stratify=stratify[train_idx] if stratify is not None else None)
+            stratify=stratify[train_idx] if stratify is not None else None,
+            groups=groups[train_idx] if groups is not None else None)
         fold_rounds.append(rounds)
 
         scores = fold_metrics(y[val_idx], bst.predict(dval))

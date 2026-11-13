@@ -9,9 +9,13 @@ so pretraining split membership is preserved exactly. A patient may have several
 anchors (one sample each, all in the patient's split); rows missing the anchor or
 the outcome are dropped and reported (load_anchors). The pretrained LM head is
 replaced by a task head (regression | binary | multiclass | survival) and finetuned
-with a selectable strategy (probe | full | two_phase). Optional IG + cohort + attention
-explainability. Outputs: checkpoints, test_metrics.json, predictions.parquet,
-and an explainability/ directory.
+with a selectable strategy (probe | full | two_phase). Optional explainability: Integrated
+Gradients and readout attention for every test prediction. Outputs: checkpoints,
+training_curves, test_metrics.json, test_eval (figure + tables), predictions.parquet,
+token_attributions.parquet and an explainability/ directory of cohort summaries. The test
+results come from best_model.pt (the epoch with the best validation score), which
+test_metrics.json records. Every reported figure and table follows the 5-patient rule
+(finetuning/finetune_plots.py).
 
 SURVIVAL: set finetuning.task: survival and name anchor_columns.censor_timestamp_col.
 The outcomes file then carries the 0/1 EVENT indicator in target_col and the timestamp of
@@ -43,8 +47,9 @@ from tracehr.dataset.ntp_batching import collate_fn
 from tracehr.dataset.streaming_datasets import StreamingAnchorsDataset
 from tracehr.dataset.vocabulary import load_vocab, vocabulary_fingerprint
 from tracehr.finetuning.finetune import finetune
-from tracehr.finetuning.outcome_evaluation import evaluate_outcome, plot_outcome_eval
-from tracehr.finetuning.outcome_explain import explain_outcome_predictions
+from tracehr.finetuning.finetune_plots import HIDDEN, plot_training_curves
+from tracehr.finetuning.outcome_evaluation import evaluate_outcome, plot_outcome_eval, reportable_metrics
+from tracehr.finetuning.outcome_explain import explain_outcome_predictions, old_individual_files
 from tracehr.finetuning.outcome_model import NTPOutcomeModel
 from tracehr.finetuning.survival_core import detect_survival_task
 from tracehr.generation.model_io import check_vocab_fingerprint, json_safe, load_checkpoint
@@ -140,7 +145,7 @@ def _check_resume_checkpoint(path: Path, config: dict, vocab_fp: str) -> None:
 
 def _check_finetune_settings(ft: dict, config: dict) -> tuple[str, str]:
     """(task, strategy) of the finetuning block, after checking them, two_phase's
-    freeze_epochs and explainability.n_steps - all before any data is read."""
+    freeze_epochs and explainability.n_steps and num_samples - all before any data is read."""
     task = ft["task"]
     if task not in ("regression", "binary", "multiclass", "survival"):
         raise ValueError(
@@ -164,6 +169,11 @@ def _check_finetune_settings(ft: dict, config: dict) -> tuple[str, str]:
     n_steps = expl_cfg.get("n_steps", 50)
     if isinstance(n_steps, bool) or not isinstance(n_steps, int) or n_steps < 1:
         raise ValueError(f"explainability.n_steps must be a whole number >= 1, got {n_steps!r}.")
+    num_samples = expl_cfg.get("num_samples")
+    if num_samples is not None and (isinstance(num_samples, bool) or not isinstance(num_samples, int)
+                                    or num_samples < 1):
+        raise ValueError(f"explainability.num_samples must be null (every test prediction) or a "
+                         f"whole number >= 1, got {num_samples!r}.")
     return task, strategy
 
 
@@ -252,17 +262,42 @@ def _class_weights(task: str, train_labels: np.ndarray, num_classes: int | None,
     return pos_weight, class_weights
 
 
-def _write_test_metrics(model: NTPOutcomeModel, test_loader: DataLoader, device, task: str,
-                        pretrain_ckpt: dict, output_dir: Path) -> None:
-    """Evaluate on the test split, print the metrics and write test_metrics.json, with the
-    pretraining arm (from the backbone's checkpoint: the architecture and its single T2E
-    setting live in the persisted model_config)."""
-    test_metrics = evaluate_outcome(model, test_loader, device, task, show_progress=True)
+def _evaluated_model(best: dict | None, history: dict, task: str,
+                     val_dataset: StreamingAnchorsDataset) -> dict:
+    """The record of the weights the test results come from (test_metrics.json,
+    explainability.json): best_model.pt, its epoch and the validation score that selected it
+    (under the 5-patient rule of the validation split), or, without a best_model.pt, the
+    last-epoch weights."""
+    epochs_trained = len(history["train_loss"])
+    if best is None:
+        return {"checkpoint": "last-epoch weights (no best_model.pt in output_dir)",
+                "epoch": epochs_trained or None, "epochs_trained": epochs_trained,
+                "selected_by": None, "val_score": None}
+    monitor = best["monitor"]
+    val_score = reportable_metrics({monitor: best["val_metrics"][monitor]}, task,
+                                   val_dataset.labels, val_dataset.patient_ids)[monitor]
+    return {"checkpoint": "best_model.pt", "epoch": best["epoch"], "epochs_trained": epochs_trained,
+            "selected_by": f"best val {monitor}", "val_score": val_score}
+
+
+def _write_test_metrics(model: NTPOutcomeModel, test_dataset: StreamingAnchorsDataset,
+                        test_loader: DataLoader, device, task: str, pretrain_ckpt: dict,
+                        evaluated_model: dict, output_dir: Path) -> None:
+    """Evaluate on the test split, print the metrics and write test_metrics.json as they may be
+    reported (reportable_metrics: the 5-patient rule), with the pretraining arm (from the
+    backbone's checkpoint: the architecture and its single T2E setting live in the persisted
+    model_config) and the record of the evaluated weights."""
+    metrics = evaluate_outcome(model, test_loader, device, task, show_progress=True)
+    test_metrics = reportable_metrics(metrics, task, test_dataset.labels, test_dataset.patient_ids)
+    withheld = [k for k in metrics if test_metrics.get(k, HIDDEN) == HIDDEN]
+    if withheld:
+        print(f"[report] 5-patient rule: {withheld} hidden ({HIDDEN}) or left out of test_metrics.json")
     pretrain_mc = pretrain_ckpt.get("model_config", {})
     test_metrics["pretrain_arm"] = {
         "loss_mode": pretrain_mc.get("loss_mode"),
         "t2e_weight": pretrain_mc.get("t2e_weight"),
     }
+    test_metrics["evaluated_model"] = evaluated_model
     print("Test metrics:", json.dumps(json_safe({k: v for k, v in test_metrics.items() if not isinstance(v, dict)}), indent=2))
     with open(output_dir / "test_metrics.json", "w") as f:
         json.dump(json_safe(test_metrics), f, indent=2)
@@ -311,9 +346,10 @@ def _write_predictions(model: NTPOutcomeModel, datasets: dict, task: str, batch_
     print(f"Saved predictions.parquet ({len(preds_rows)} rows)")
 
 
-def _plot_test_eval(model: NTPOutcomeModel, test_loader: DataLoader, task: str, device,
-                    output_dir: Path) -> None:
-    """test_eval.png: the task's evaluation plot of the test split (plot_outcome_eval)."""
+def _plot_test_eval(model: NTPOutcomeModel, test_dataset: StreamingAnchorsDataset,
+                    test_loader: DataLoader, task: str, device, output_dir: Path) -> None:
+    """test_eval.png/.svg and its tables: the task's evaluation figure of the test split
+    (plot_outcome_eval)."""
     stats = {"labels": [], "preds": []}
     model.eval()
     with torch.no_grad():
@@ -324,8 +360,9 @@ def _plot_test_eval(model: NTPOutcomeModel, test_loader: DataLoader, task: str, 
                 (out["probs"] if task in ("binary", "multiclass")
                  else out["predictions"]).cpu().numpy())
             stats["labels"].append(batch["labels"].cpu().numpy())
+    # test_loader is not shuffled, so the dataset's patient ids follow the predictions' order
     plot_outcome_eval(task, np.concatenate(stats["labels"]), np.concatenate(stats["preds"]),
-                      str(output_dir / "test_eval.png"))
+                      test_dataset.patient_ids, output_dir)
 
 
 def main(config_path: str):
@@ -455,7 +492,7 @@ def main(config_path: str):
 
     # ── Fine-tune ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60 + "\n  FINE-TUNING\n" + "=" * 60)
-    finetune(
+    history = finetune(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -477,11 +514,21 @@ def main(config_path: str):
 
     # ── Load best checkpoint ──────────────────────────────────────────────────
     best_ckpt = output_dir / "best_model.pt"
+    ckpt = None
     if best_ckpt.exists():
         ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
         check_vocab_fingerprint(ckpt, vocab_fp, best_ckpt, config["data"]["vocab_path"])
         model.load_state_dict(ckpt["model_state_dict"])
         print(f"Loaded best checkpoint (epoch {ckpt.get('epoch', '?')})")
+    else:
+        print(f"WARNING: {output_dir} holds no best_model.pt: the test results come from the "
+              f"last-epoch weights, and test_metrics.json records this.")
+    # Which weights the test results come from, for test_metrics.json, explainability.json and
+    # the training curves (redrawn once with that epoch marked)
+    evaluated_model = _evaluated_model(ckpt, history, task, val_dataset)
+    if ckpt is not None and history["train_loss"]:
+        plot_training_curves(history, ckpt["monitor"], unfreeze_after_epochs,
+                             output_dir / "training_curves", evaluated_epoch=ckpt["epoch"])
 
     # ── Test evaluation and predictions ───────────────────────────────────────
     if not resolved["test"]:
@@ -491,10 +538,11 @@ def main(config_path: str):
     test_dataset = make_dataset(resolved["test"])
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, **loader_kwargs)
     print(f"Test windows: {len(test_dataset)}")
-    _write_test_metrics(model, test_loader, device, task, pretrain_ckpt, output_dir)
+    _write_test_metrics(model, test_dataset, test_loader, device, task, pretrain_ckpt,
+                        evaluated_model, output_dir)
     _write_predictions(model, {"train": train_dataset, "val": val_dataset, "test": test_dataset},
                        task, batch_size, loader_kwargs, device, output_dir)
-    _plot_test_eval(model, test_loader, task, device, output_dir)
+    _plot_test_eval(model, test_dataset, test_loader, task, device, output_dir)
 
     # ── Explainability ────────────────────────────────────────────────────────
     if expl_cfg.get("enabled", True):
@@ -503,16 +551,23 @@ def main(config_path: str):
             model=model,
             dataset=test_dataset,
             vocab_itos=vocab_itos,
+            vocab_stats=vocab_stats,
             task=task,
             output_dir=str(output_dir),
             collate_fn=collate_fn,
-            num_samples=expl_cfg.get("num_samples", 20),
+            num_samples=expl_cfg.get("num_samples"),
             top_k_tokens=expl_cfg.get("top_k_tokens", 25),
             n_steps=expl_cfg.get("n_steps", 50),
             batch_size=batch_size,
             device=str(device),
             plot_attention=expl_cfg.get("plot_attention", True),
+            evaluated_model=evaluated_model,
         )
+    else:
+        old = old_individual_files(output_dir / "explainability")
+        if old:
+            print(f"WARNING: explainability is off, so {output_dir / 'explainability'} still holds "
+                  f"individual-level files of an earlier run: {[p.name for p in old]}")
 
     print(f"\nDone! Outputs saved to: {output_dir}")
 

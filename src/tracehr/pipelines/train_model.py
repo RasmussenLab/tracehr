@@ -37,7 +37,7 @@ from tracehr.dataset.windows import (
     window_capacity,
     window_npz_geometry_mismatch,
 )
-from tracehr.ntp_model.ntp_transformer import ROPE_TIME_MAX_DAYS, NTPTransformer
+from tracehr.ntp_model.ntp_transformer import ROPE_TIME_MAX_DAYS, T2E_INTERVAL_NAMES, NTPTransformer
 from tracehr.training.one_epoch import train_one_epoch
 from tracehr.training.plots import (
     plot_accuracy,
@@ -114,8 +114,8 @@ def _refuse_removed_settings(model_cfg: dict) -> None:
     if removed:
         raise ValueError(
             f"Removed model setting(s): {removed}. Every model resolves time to the minute: "
-            "the T2E grid, the fastest Age-RoPE rotation and Time2Vec's daily cycle are fixed. "
-            "Remove them."
+            "the T2E's same-minute interval, the fastest Age-RoPE rotation and Time2Vec's daily "
+            "cycle are fixed. Remove them."
         )
 
 
@@ -203,20 +203,20 @@ def _load_event_times(data_cfg: dict, cols: dict, t2e_pred: bool):
     split's patient and row counts reported.
 
     Every model resolves time to the minute (TIME_RESOLUTION_DAYS, ntp_transformer.py): the
-    T2E grid, the fastest Age-RoPE rotation and Time2Vec's daily cycle are fixed. Every
-    patient's rows are checked once here; each reader leaves out the rows and patients that
-    fail and computes time_age and time_abs from the timestamps.
+    T2E's same-minute interval, the fastest Age-RoPE rotation and Time2Vec's daily cycle are
+    fixed. Every patient's rows are checked once here; each reader leaves out the rows and
+    patients that fail and computes time_age and time_abs from the timestamps.
     """
-    print("[time] times are resolved to the minute: T2E grid, fastest Age-RoPE rotation "
-          "(1 rad per minute), Time2Vec daily cycle")
+    print("[time] times are resolved to the minute: T2E same-minute interval, fastest Age-RoPE "
+          "rotation (1 rad per minute), Time2Vec daily cycle")
     event_times = load_event_times(data_cfg["parquet_path"], cols, data_cfg["vocab_path"])
     for split, ids_key in (("train", "train_ids"), ("val", "val_ids")):
         n_patients, n_rows = count_rows(data_cfg["parquet_path"], event_times, cols["id_col"],
                                         cols["tok_col"], load_patient_id_filter(data_cfg[ids_key]))
         print(f"  {split} split ({data_cfg[ids_key]}): {n_patients:,} patients, {n_rows:,} rows")
     if t2e_pred:
-        print("[t2e] waiting times scored on the 1-minute grid as P(gap in its cell), events "
-              "in the same minute as k=0; finer recordings (seconds) are coarsened into the cells")
+        print("[t2e] gaps scored by their interval under a piecewise-constant hazard: "
+              + ", ".join(T2E_INTERVAL_NAMES))
     return event_times
 
 
@@ -342,8 +342,8 @@ def _make_loader(dataset, config: dict, shuffle: bool) -> DataLoader:
 # ============================================================================ #
 def _build_model(model_cfg: dict, vocab_size: int, num_types: int, stoi: dict, t2e_weight: float,
                  loss_mode: str, train_loader: DataLoader, device) -> NTPTransformer:
-    """The NTPTransformer of model_cfg on device, with the T2E rate offset calibrated on one
-    probe batch (and that batch's ages checked against the Age-RoPE span); its summaries
+    """The NTPTransformer of model_cfg on device, with the T2E interval offsets calibrated on
+    one probe batch (and that batch's ages checked against the Age-RoPE span); its summaries
     are printed."""
     # Resolved ONCE here and reused for both the span check below and the constructor, so
     # the check and the model it is checking can never disagree about the ladder.
@@ -351,7 +351,7 @@ def _build_model(model_cfg: dict, vocab_size: int, num_types: int, stoi: dict, t
     rope_time_max_days = float(model_cfg.get("rope_time_max_days", ROPE_TIME_MAX_DAYS))
     rope_hybrid_split = float(model_cfg.get("rope_hybrid_split", 0.5))
     rope_needs_age = rope_mode in ("age", "hybrid")
-    # One probe batch, for the Age-RoPE span check below and the T2E rate offset. Every
+    # One probe batch, for the Age-RoPE span check below and the T2E interval offsets. Every
     # DataLoader iterator draws a base seed from the global torch RNG, so the state is
     # restored - otherwise the model's init weights would depend on whether a probe ran at
     # a fixed seed.
@@ -395,11 +395,11 @@ def _build_model(model_cfg: dict, vocab_size: int, num_types: int, stoi: dict, t
         loss_mode=loss_mode,
         t2e_exclude_ids=model_cfg.get("t2e_exclude_ids"),
     ).to(device)
-    # T2E rate level: fit the coupled scalar offset to the probe batch's exact grid likelihood
+    # T2E gap distribution: fit the interval offsets to the probe batch's interval shares
     # before any training step, so neither the token logits nor the trunk has to move to set it.
     # The probe is deterministic here: the global RNG was restored after it.
     if model.t2e_pred:
-        print(model.calibrate_t2e_rate_offset(
+        print(model.calibrate_t2e_interval_offsets(
             {k: v.to(device) for k, v in probe.items() if isinstance(v, torch.Tensor)}))
 
     print(f"Model parameters: {count_params(model):,}")

@@ -20,7 +20,6 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -30,6 +29,7 @@ from ..dataset.meds_reader import (
     ABS_COL,
     AGE_COL,
     canonical_sort,
+    connect,
     event_source,
     normalized_sql,
     sql_in,
@@ -359,7 +359,7 @@ def _count_windows(parquet_path, cutoffs, preamble_slots, *, id_col, tok_col, ti
     min_seq_len = validate_window_floor(min_seq_len, K)
     op = "<" if remove_cutoff_token else "<="
     pairs = [(pid, float(c)) for pid, cs in cutoffs.items() for c in cs]
-    con = duckdb.connect()
+    con = connect()
     try:
         source = event_source(con, parquet_path, event_times, id_col, tok_col, None)
         con.register("_anchors", pa.table({

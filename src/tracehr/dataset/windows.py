@@ -10,7 +10,6 @@ embedding extraction of pipeline 04 - so they all produce identical windows.
 
 from typing import NamedTuple
 
-import duckdb
 import numpy as np
 
 from .cohort import load_patient_id_filter
@@ -18,6 +17,7 @@ from .meds_reader import (
     ABS_COL,
     AGE_COL,
     canonical_sort,
+    connect,
     event_source,
     normalized_sql,
     register_ids,
@@ -523,6 +523,29 @@ def window_store_rescoring(npz_path: str) -> str | None:
 # ============================================================================ #
 # Writing the window store
 # ============================================================================ #
+def count_windows(parquet_path, event_times, id_col, tok_col, ids, real_len, stride,
+                  min_seq_len, add_final_window, start_from_end) -> tuple[int, np.ndarray]:
+    """(number of windows, patient ids) of these patients (ids None = all), from one DuckDB
+    aggregation instead of reading every patient: the length after the front block is events -
+    sex/static rows (extract_preamble_tokens removes ALL of them), so plan_windows(length) gives
+    each patient's exact window count, and below min_seq_len none."""
+    con = connect()
+    try:
+        source = event_source(con, parquet_path, event_times, id_col, tok_col, None)
+        where = register_ids(con, ids, id_col)
+        is_pre = sql_in(normalized_sql(f'e."{tok_col}"'), event_times.preamble_tokens)
+        agg = (f'SELECT "{id_col}" AS pid, COUNT(*) AS n, SUM(CASE WHEN {is_pre} THEN 1 ELSE 0 END) AS n_pre '
+               f'FROM {source} AS e{where} GROUP BY "{id_col}"')
+        summary = con.execute(agg).fetchnumpy()
+    finally:
+        con.close()
+    n_windows = 0
+    for n, n_pre in zip(summary["n"].tolist(), summary["n_pre"].tolist()):
+        n_windows += len(plan_windows(int(n) - int(n_pre), real_len, stride,
+                                      min_seq_len, add_final_window, start_from_end))
+    return n_windows, summary["pid"]
+
+
 def create_sequence_windows(
     parquet_path: str,
     vocab_path: str,                            # Expects stoi with <SOS>, <CON>, <PAD>, <UNK>
@@ -561,24 +584,8 @@ def create_sequence_windows(
     ids = load_patient_id_filter(ids_path)
 
     # ── Pass 1: count windows + resolve patient_id dtype (cheap DuckDB aggregation) ──
-    # length after the front block = events - sex/static rows (extract_preamble_tokens removes
-    # ALL of them), so plan_windows(length) gives each patient's exact window count.
-    con = duckdb.connect()
-    try:
-        source = event_source(con, parquet_path, event_times, id_col, tok_col, type_col)
-        where = register_ids(con, ids, id_col)
-        is_pre = sql_in(normalized_sql(f'e."{tok_col}"'), event_times.preamble_tokens)
-        agg = (f'SELECT "{id_col}" AS pid, COUNT(*) AS n, SUM(CASE WHEN {is_pre} THEN 1 ELSE 0 END) AS n_pre '
-               f'FROM {source} AS e{where} GROUP BY "{id_col}"')
-        summary = con.execute(agg).fetchnumpy()
-    finally:
-        con.close()
-
-    pids = summary["pid"]
-    n_windows = 0
-    for n, n_pre in zip(summary["n"].tolist(), summary["n_pre"].tolist()):
-        n_windows += len(plan_windows(int(n) - int(n_pre), real_len, stride,
-                                      min_seq_len, add_final_window, start_from_end))
+    n_windows, pids = count_windows(parquet_path, event_times, id_col, tok_col, ids, real_len,
+                                    stride, min_seq_len, add_final_window, start_from_end)
     pid_dtype = (pids.dtype if np.issubdtype(pids.dtype, np.number)
                  else f"U{max((len(str(x)) for x in pids.tolist()), default=1)}")
 

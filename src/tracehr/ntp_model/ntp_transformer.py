@@ -5,9 +5,10 @@ its rotary positions and its time-to-event (T2E) likelihood.
 The model embeds tokens, event types and times (Time2Vec), runs a stack of pre-norm
 transformer blocks with RoPE (index positions, Age positions, or both), and scores the next
 token with the scorer of its token objective (TOKEN_LOSSES: plain cross-entropy or HALO).
-With t2e_weight > 0 the same logits also define a coupled competing-risks event rate whose
-waiting-time likelihood is scored on a 1-minute grid (t2e_interval_nll). All times are float64
-days; the module constants below fix the time resolution and the Age-RoPE ladder.
+With t2e_weight > 0 the same logits also define a coupled competing-risks event rate, and the
+gap to the next event is scored by its interval under a piecewise-constant hazard
+(t2e_interval_nll). All times are float64 days; the module constants below fix the time
+resolution, the T2E intervals and the Age-RoPE ladder.
 """
 
 import math
@@ -15,6 +16,7 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blocks import TransformerBlock
 from .config import NTPTransformerConfig
@@ -37,16 +39,9 @@ DAYS_PER_YEAR = 365.25
 # TIME RESOLUTION: every model resolves time to the minute, for both kinds of time input.
 # The times stay float64 from the reader into the model, so a minute is exact at any age.
 # It fixes three things:
-#   * The T2E grid. Recorded times are rounded to a grid, so a waiting time of "0" means
-#     "within the same minute", not "instantly". The waiting-time loss is therefore the
-#     exact likelihood of the gap landing in its grid cell,
-#         P(k) = P(k*res <= T < (k+1)*res) = exp(-a*k) * (1 - exp(-a)),   a = lambda * res,
-#     for k = 0, 1, 2, ... (a geometric distribution on grid cells). It needs no stability
-#     floor (the t_min it replaces biased every gap by t_min and every rate toward 1/t_min),
-#     handles same-minute events as k = 0 with probability 1 - exp(-a), and is a genuine
-#     log-probability, so the loss does not depend on the time unit. A recording finer than
-#     the grid (seconds) is coarsened into its cell (see t2e_grid_cells); a coarser one
-#     (whole days) simply never lands between the day multiples.
+#   * The T2E's first interval. Recorded times are rounded to the minute, so a gap of "0"
+#     means "within the same minute", not "instantly": the T2E scores it in its own first
+#     interval, [0, 1 minute) (see T2E_INTERVAL_EDGES_DAYS).
 #   * The fastest Age-RoPE rotation: 1 rad per minute (see the RoPE note below).
 #   * Time2Vec's daily cycle: its first pair has a 1-day period, the time of day.
 TIME_RESOLUTION_DAYS = 1.0 / 1440
@@ -104,62 +99,96 @@ def _log1mexp_from_log(r: torch.Tensor) -> torch.Tensor:
     return torch.where(tiny, out_tiny, torch.where(mid, out_mid, out_big))
 
 
-def t2e_grid_cells(time_deltas_days: torch.Tensor, resolution_days: float) -> torch.Tensor:
-    """Grid cell k of each gap, k*res <= gap < (k+1)*res, as float64 [..].
+# T2E INTERVALS. The gap from an event to the next is scored by the interval it lands in,
+# under a piecewise-constant hazard lambda * exp(c_j): lambda is the coupled event rate
+# (_t2e_log_rate) and c_0..c_6 the model's t2e_interval_offsets, shared by all positions. The
+# bounds, in days: the same minute (TIME_RESOLUTION_DAYS), 1 hour, 1 day, 1 week, 1 month,
+# 6 months and 1 year; the last interval, a year or more, needs no offset of its own.
+T2E_INTERVAL_EDGES_DAYS = (TIME_RESOLUTION_DAYS, 1.0 / 24, 1.0, 7.0, DAYS_PER_YEAR / 12,
+                           DAYS_PER_YEAR / 2, DAYS_PER_YEAR)
+T2E_INTERVAL_NAMES = ("same minute", "1 min - 1 h", "1 h - 1 d", "1 d - 1 wk", "1 wk - 1 mo",
+                      "1 - 6 mo", "6 mo - 1 y", "1 y or more")
+_T2E_INTERVAL_STARTS_DAYS = (0.0,) + T2E_INTERVAL_EDGES_DAYS[:-1]
+_T2E_INTERVAL_WIDTHS_DAYS = tuple(hi - lo for lo, hi in zip(_T2E_INTERVAL_STARTS_DAYS,
+                                                            T2E_INTERVAL_EDGES_DAYS))
+# log(width in years) of each bounded interval: the rate lambda is per year
+_T2E_INTERVAL_LOG_WIDTHS = tuple(math.log(w / DAYS_PER_YEAR) for w in _T2E_INTERVAL_WIDTHS_DAYS)
 
-    FLOORED, so a recording finer than the grid is coarsened correctly: a 40-second gap on
-    the 1-minute grid is in cell 0, not 1 (rounding would shift every gap by half a cell).
-    A gap that is an exact multiple of the grid can sit just below its integer, by the
-    rounding of the gap's own dtype, so a slack of one eps of that dtype (relative) plus 1e-6
-    of a cell puts it in its own cell. The datasets give float64 gaps, differenced from
-    float64 Ages: there the slack moves a cell boundary by only ~60 microseconds on the minute
-    grid, at any gap length. (A float32 gap holds a month only to ~0.3 s, so its boundaries
-    move by that much.) float64 also counts the cells exactly: a century is ~5e7 minutes,
-    past float32's exact integers (2**24, ~32 years). clamp guards the -1 sentinel.
+
+def t2e_interval_index(time_deltas_days: torch.Tensor) -> torch.Tensor:
+    """The interval of each gap, 0-7, as int64 [..]. A gap on a bound belongs to the later
+    interval. Gaps are differences of float64 Ages, so a gap a rounding error below a bound
+    counts as on it (slack: one float64 eps, relative, plus 1e-9 days, ~0.1 ms). clamp puts
+    the -1 sentinel in interval 0."""
+    gaps = time_deltas_days.double().clamp(min=0.0)
+    edges = torch.tensor(T2E_INTERVAL_EDGES_DAYS, dtype=torch.float64, device=gaps.device)
+    return torch.bucketize(gaps * (1.0 + torch.finfo(torch.float64).eps) + 1e-9, edges, right=True)
+
+
+def t2e_log_hazards(log_rate: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """log H_j [.., 7], the log cumulative hazard over each bounded interval:
+    log(lambda) + c_j + log(width_j in years), in float32.
+
+    Divergence guard: the value is capped at 75 while the gradient passes straight through,
+    so an overflowing rate cannot turn the gradient into inf * 0 = NaN and destroy every
+    weight in one step; it still points back toward sane rates. Nothing a trained model
+    emits comes near it.
     """
-    eps = torch.finfo(time_deltas_days.dtype).eps if time_deltas_days.is_floating_point() else 0.0
-    x = time_deltas_days.double().clamp(min=0.0) / resolution_days
-    return torch.floor(x * (1.0 + eps) + 1e-6)
+    log_widths = torch.tensor(_T2E_INTERVAL_LOG_WIDTHS, dtype=torch.float64)
+    r = log_rate.float().unsqueeze(-1) + offsets.float() + log_widths.to(log_rate.device, torch.float32)
+    return r - (r - r.clamp(max=75.0)).detach()
 
 
-def t2e_interval_nll(log_rate: torch.Tensor, time_deltas_days: torch.Tensor,
-                     resolution_days: float) -> torch.Tensor:
-    """Per-position NLL of the observed waiting time under Exponential(lambda), with the
-    time known only to its grid cell: -log P(k) = a*k - log(1 - exp(-a)).
+def t2e_interval_nll(log_rate: torch.Tensor, offsets: torch.Tensor,
+                     time_deltas_days: torch.Tensor) -> torch.Tensor:
+    """Per-position NLL of the observed gap's interval j [..] in float32:
+    -log P(j) = H_0 + ... + H_(j-1) - log(1 - exp(-H_j)), as P(j) = S(start of j) - S(end of j)
+    with S = exp(-cumulative hazard); the open last interval has P = S(1 year), so its NLL is
+    H_0 + ... + H_6.
 
     log_rate:          log(lambda), lambda per YEAR (the model's internal unit)   [..]
+    offsets:           c_0..c_6, the model's t2e_interval_offsets                 [7]
     time_deltas_days:  observed gaps in DAYS, >= 0 where scored                    [..]
-    resolution_days:   grid in DAYS (1.0 = whole days); the recording grid or coarser
     Positions the caller will mask may hold anything finite (e.g. the -1 sentinel).
     """
-    r = log_rate.float() + math.log(resolution_days / DAYS_PER_YEAR)   # log(a)
-    # Divergence guard. a*k = lambda * gap is what overflows: exp(r + log k) passes the
-    # float32 limit for a century-long gap once lambda exceeds ~e^75 events per DAY, and at
-    # r ~ 89 exp(r) itself is inf; either turns the gradient into inf * 0 = NaN and destroys
-    # every weight in one step. The cap is on the per-day rate, r <= 75 + log(res), so the
-    # bound holds on every grid (a 1-second grid has 86,400x more cells per gap than whole
-    # days); on whole days it is r <= 75. The VALUE is capped while the gradient passes
-    # straight through, so it stays finite and still points back toward sane rates. Nothing
-    # a trained model emits comes near it: one event per second is e^11.4 per day.
-    r = r - (r - r.clamp(max=75.0 + math.log(resolution_days))).detach()
-    k = t2e_grid_cells(time_deltas_days, resolution_days)                  # float64
-    # a*k written as exp(r + log k) so that k = 0 contributes exactly 0 even if a overflows
-    # (inf * 0 = NaN otherwise). Computed in float64 with the exact cell count; the loss
-    # itself is returned in float32, as the rest of the objective is.
-    k_safe = torch.where(k > 0, k, torch.ones_like(k))
-    ak = torch.where(k > 0, torch.exp(r + torch.log(k_safe)), torch.zeros_like(k))
-    return (ak - _log1mexp_from_log(r)).float()
+    r = t2e_log_hazards(log_rate, offsets)                                  # [.., 7]
+    before = F.pad(torch.cumsum(torch.exp(r), dim=-1), (1, 0))              # [.., 8] H_0 + ... + H_(j-1)
+    ending = F.pad(-_log1mexp_from_log(r), (0, 1))                          # [.., 8] -log(1 - e^-H_j), 0 for the last
+    j = t2e_interval_index(time_deltas_days)
+    return (before + ending).gather(-1, j.unsqueeze(-1)).squeeze(-1)
 
 
-def t2e_expected_delta(log_rate: torch.Tensor, resolution_days: float) -> torch.Tensor:
-    """Expected waiting time in DAYS under the same grid model: res * E[k] = res / expm1(a).
+def t2e_median_gap(log_rate: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """The median gap in DAYS [..] float64, the T2E prediction: in the first interval whose
+    cumulative hazard reaches log 2, at the point its constant hazard reaches it; past 1 year,
+    where the 6-month - 1-year hazard continues, when no bounded interval does. Always > 0."""
+    hazard = torch.exp(t2e_log_hazards(log_rate, offsets).double())        # [.., 7]
+    after = torch.cumsum(hazard, dim=-1)
+    reached = after >= _LN2
+    j = torch.where(reached.any(dim=-1), reached.int().argmax(dim=-1),
+                    torch.full_like(reached[..., 0], len(T2E_INTERVAL_EDGES_DAYS) - 1,
+                                    dtype=torch.int64))
+    starts = torch.tensor(_T2E_INTERVAL_STARTS_DAYS, dtype=torch.float64, device=hazard.device)
+    widths = torch.tensor(_T2E_INTERVAL_WIDTHS_DAYS, dtype=torch.float64, device=hazard.device)
 
-    The mean of the distribution the loss scores, so predictions and loss agree on what
-    the model claims. With a -> 0 it tends to 1/lambda - res/2 (the continuous mean,
-    shifted to the cell's lower edge). In float64, like every time value.
-    """
-    a = torch.exp(log_rate.double() + math.log(resolution_days / DAYS_PER_YEAR))
-    return resolution_days / torch.expm1(a)
+    def at(x):
+        return x.gather(-1, j.unsqueeze(-1)).squeeze(-1)
+
+    per_day = (at(hazard) / widths[j]).clamp(min=1e-300)
+    return starts[j] + (_LN2 - at(after - hazard)) / per_day
+
+
+def t2e_calibrated_offsets(log_rate: torch.Tensor, intervals: torch.Tensor) -> torch.Tensor:
+    """The offsets c_0..c_6 [7] float64 that, at the constant rate exp(mean log(lambda)), give
+    each interval exactly its observed share (the maximum-likelihood fit for one constant
+    rate): interval j's cumulative hazard is -log(1 - d_j / n_j), with d_j gaps in interval j
+    and n_j gaps reaching it. The shares are clamped to [1e-4, 1 - 1e-4], so an empty interval
+    stays finite."""
+    counts = torch.bincount(intervals.cpu(), minlength=len(T2E_INTERVAL_NAMES)).double()
+    reaching = counts.flip(0).cumsum(0).flip(0)[:-1]
+    share = (counts[:-1] / reaching.clamp(min=1.0)).clamp(1e-4, 1.0 - 1e-4)
+    log_widths = torch.tensor(_T2E_INTERVAL_LOG_WIDTHS, dtype=torch.float64)
+    return torch.log(-torch.log1p(-share)) - log_widths - log_rate.double().cpu().mean()
 
 
 class NTPTransformer(nn.Module):
@@ -230,8 +259,6 @@ class NTPTransformer(nn.Module):
         if not math.isfinite(self.t2e_weight) or self.t2e_weight < 0.0:
             raise ValueError(f"t2e_weight must be finite and >= 0, got {t2e_weight!r}.")
         self.t2e_pred = self.t2e_weight > 0.0
-        # T2E deltas are days, known only to their 1-minute grid cell (see TIME_RESOLUTION_DAYS)
-        self.t2e_time_resolution_days = TIME_RESOLUTION_DAYS
         # Vocabulary mask of the non-event tokens (PAD/SOS/CON/...) kept out of the event
         # rate; non-persistent: rebuilt from the config, never loaded from a checkpoint
         self.t2e_exclude_ids = sorted(int(i) for i in t2e_exclude_ids) if t2e_exclude_ids else []
@@ -276,15 +303,17 @@ class NTPTransformer(nn.Module):
         # The objective supplies the scorer but the MODEL registers it, so the state_dict
         # key stays "head.weight" and every consumer of model.head keeps working.
         self.head = token_loss.build_head()
-        # Coupled T2E rate offset: log(lambda) = logsumexp(event logits) + b. Without it, the
-        # overall rate level can only be set by shifting EVERY token logit, and that gradient
-        # dominates early training and slows token learning. b is invisible to the softmax
-        # (a common shift), and the per-type hazards exp(logit_k + b) stay a consistent
-        # competing-risks model. A bare parameter with a fixed init: no RNG draw, untouched by
-        # _init_weights, 0-d so the optimizer's rule keeps weight decay off it. Set from the
-        # data before training by calibrate_t2e_rate_offset. With T2E off there is no rate.
-        self.t2e_log_rate_offset = (nn.Parameter(torch.zeros(()))
-                                    if self.t2e_pred else None)
+        # T2E interval offsets c_0..c_6: the hazard in interval j is lambda * exp(c_j), with
+        # log(lambda) = logsumexp(event logits) (see T2E_INTERVAL_EDGES_DAYS). Shared by all
+        # positions, they set the shape of the gap distribution and its overall level, which
+        # otherwise only shifting EVERY token logit could set (a gradient that dominates
+        # early training and slows token learning). Invisible to the softmax, and the
+        # per-type hazards exp(logit_k + c_j) stay a consistent competing-risks model. Bare
+        # parameters with a fixed init: no RNG draw, untouched by _init_weights, 1-d so the
+        # optimizer's rule keeps weight decay off them. Set from the data before training by
+        # calibrate_t2e_interval_offsets. With T2E off there are none.
+        self.t2e_interval_offsets = (nn.Parameter(torch.zeros(len(T2E_INTERVAL_EDGES_DAYS)))
+                                     if self.t2e_pred else None)
         # The objective itself. A submodule, so an objective with parameters reaches the
         # optimizer, the state_dict and count_params with no pipeline change; plain CE owns
         # none and therefore adds no state_dict entries.
@@ -566,105 +595,39 @@ class NTPTransformer(nn.Module):
         Underflow Well Inside The Range Real Gaps Drive log_rate Into.
         """
         log_rate = torch.logsumexp(self._mask_non_event_logits(logits.float()), dim=-1)
-        log_rate = self.token_loss.adjust_coupled_log_rate(log_rate, hidden_states)
-        return log_rate + self.t2e_log_rate_offset.float()
+        return self.token_loss.adjust_coupled_log_rate(log_rate, hidden_states)
 
     @torch.no_grad()
-    def calibrate_t2e_rate_offset(self, batch: dict[str, torch.Tensor]) -> str:
-        """Fit the scalar rate offset to this batch's exact grid likelihood.
+    def calibrate_t2e_interval_offsets(self, batch: dict[str, torch.Tensor]) -> str:
+        """Fit the interval offsets to this batch's interval shares (t2e_calibrated_offsets).
 
-        All network outputs stay fixed. Only the common offset b is solved, so token logits
-        and probabilities cannot move. The derivative is monotone in b; bounded bisection
-        therefore gives the unique finite optimum without an optimizer or another data pass.
+        All network outputs stay fixed. Only the offsets c_j are set, in closed form, so token
+        logits and probabilities cannot move.
         """
         if not self.t2e_pred:
-            raise RuntimeError("calibrate_t2e_rate_offset needs t2e_weight > 0 (T2E is off).")
-        level = self.t2e_log_rate_offset
+            raise RuntimeError("calibrate_t2e_interval_offsets needs t2e_weight > 0 (T2E is off).")
+        offsets = self.t2e_interval_offsets
         was_training = self.training
         try:
             self.eval()
-            level.zero_()
+            offsets.zero_()
             out = self({k: v for k, v in batch.items() if k != "labels"})
-            labels, deltas = batch["labels"], batch["time_deltas"]
-            mask = (labels != -100) & (deltas >= 0)
+            mask = (batch["labels"] != -100) & (batch["time_deltas"] >= 0)
             if not bool(mask.any()):
-                return "[t2e] rate offset left at 0: the calibration batch has no scored waiting time"
-
-            res = self.t2e_time_resolution_days
-            valid_deltas = deltas[mask].double().cpu()
-            cells = t2e_grid_cells(valid_deltas, res)
-            base_log_rate = self._t2e_log_rate(
-                out["logits"], out["hidden_states"])[mask].double().cpu()
-            if not (torch.isfinite(cells).all() and torch.isfinite(base_log_rate).all()):
-                raise ValueError("T2E calibration received non-finite rates or waiting times.")
-
-            before = float(t2e_interval_nll(
-                base_log_rate.float(), valid_deltas, res).mean())
-            log_cell_scale = math.log(res / DAYS_PER_YEAR)
-
-            def derivative(offset: float) -> float:
-                """d mean(NLL) / d offset, evaluated stably in float64 on CPU."""
-                log_a = base_log_rate + offset + log_cell_scale
-                # Bisection never needs astronomical a, but clamp prevents exp overflow if
-                # malformed initial logits force a wide bracket. For a >= exp(50),
-                # a/expm1(a) is numerically zero and the gradient's sign is already settled.
-                a = torch.exp(log_a.clamp(max=50.0))
-                small = log_a < -20.0
-                survival_term = torch.where(
-                    small,
-                    1.0 - 0.5 * a + a.square() / 12.0,
-                    a / torch.expm1(a),
-                )
-                return float((a * cells - survival_term).mean())
-
-            if not bool((cells > 0).any()):
-                # With only cell-zero observations the likelihood improves monotonically as
-                # lambda grows, so no finite MLE exists. Use the guarded constant-rate
-                # convention and say so explicitly rather than pretending bisection found an
-                # optimum.
-                mean_cells = 1e-6
-                target_log_rate = math.log(
-                    math.log1p(1.0 / mean_cells) * DAYS_PER_YEAR / res)
-                offset = target_log_rate - float(base_log_rate.mean())
-                status = "finite all-zero-gap fallback"
-            else:
-                # The constant-rate solution (one rate matching the mean cell) is an excellent
-                # centre for the bracket. It also makes the number of derivative evaluations
-                # independent of rate scale.
-                mean_cells = float(cells.mean())
-                target_log_rate = math.log(
-                    math.log1p(1.0 / mean_cells) * DAYS_PER_YEAR / res)
-                centre = target_log_rate - float(base_log_rate.mean())
-                low, high = centre - 2.0, centre + 2.0
-                for _ in range(32):
-                    if derivative(low) <= 0.0:
-                        break
-                    low -= 2.0
-                for _ in range(32):
-                    if derivative(high) >= 0.0:
-                        break
-                    high += 2.0
-                if derivative(low) > 0.0 or derivative(high) < 0.0:
-                    raise RuntimeError("Could not bracket the finite T2E rate-offset optimum.")
-                for _ in range(48):
-                    mid = 0.5 * (low + high)
-                    if derivative(mid) < 0.0:
-                        low = mid
-                    else:
-                        high = mid
-                offset = 0.5 * (low + high)
-                status = "exact grid optimum"
-
-            level.fill_(offset)
-            after_log_rate = base_log_rate.float() + float(offset)
-            after = float(t2e_interval_nll(after_log_rate, valid_deltas, res).mean())
-            if not (math.isfinite(offset) and math.isfinite(after)):
-                level.zero_()
-                raise ValueError("T2E calibration produced a non-finite offset or loss.")
-            return (f"[t2e] rate offset calibrated on {int(mask.sum()):,} waiting times "
-                    f"({status}, mean gap {float(cells.mean()) * res:.1f} days): "
-                    f"grid NLL {before:.4f} -> {after:.4f}, offset {offset:+.3f} "
-                    f"(token logits untouched)")
+                return "[t2e] interval offsets left at 0: the calibration batch has no scored gap"
+            log_rate = self._t2e_log_rate(out["logits"], out["hidden_states"])[mask]
+            deltas = batch["time_deltas"][mask]
+            if not (torch.isfinite(log_rate).all() and torch.isfinite(deltas).all()):
+                raise ValueError("T2E calibration received non-finite rates or gaps.")
+            intervals = t2e_interval_index(deltas)
+            before = float(t2e_interval_nll(log_rate, offsets, deltas).mean())
+            offsets.copy_(t2e_calibrated_offsets(log_rate, intervals).to(offsets))
+            after = float(t2e_interval_nll(log_rate, offsets, deltas).mean())
+            counts = torch.bincount(intervals.cpu(), minlength=len(T2E_INTERVAL_NAMES)).tolist()
+            shares = ", ".join(f"{name} {n / intervals.numel():.3f}"
+                               for name, n in zip(T2E_INTERVAL_NAMES, counts))
+            return (f"[t2e] interval offsets calibrated on {intervals.numel():,} gaps (shares "
+                    f"{shares}): interval NLL {before:.4f} -> {after:.4f} (token logits untouched)")
         finally:
             self.train(was_training)
 
@@ -674,12 +637,12 @@ class NTPTransformer(nn.Module):
         time_deltas: torch.Tensor,
         mask: torch.Tensor
     ) -> torch.Tensor:
-        """Mean waiting-time NLL over the valid positions (see t2e_interval_nll).
+        """Mean interval NLL over the valid positions (see t2e_interval_nll).
 
-        The waiting time to the next event is Exponential(lambda), observed only to its
-        recording grid cell (t2e_time_resolution_days), so each position scores
-        -log P(gap in its cell). Same exponential model as Delphi; the exact grid
-        likelihood replaces Delphi's t_min / 1-day-floor approximation of it.
+        Each position scores -log P(the gap's interval) under the piecewise-constant hazard
+        lambda * exp(c_j). The coupling of lambda to the token logits is Delphi's; the
+        intervals replace its single exponential, whose one rate per position cannot fit
+        same-minute gaps and gaps of months at once.
 
         Args:
             log_rate: log(lambda) [B, T] float32, per year (from _t2e_log_rate)
@@ -689,7 +652,7 @@ class NTPTransformer(nn.Module):
         Returns:
             Scalar loss (mean NLL over valid positions)
         """
-        nll = t2e_interval_nll(log_rate, time_deltas, self.t2e_time_resolution_days)
+        nll = t2e_interval_nll(log_rate, self.t2e_interval_offsets, time_deltas)
         # where, not nll * mask: a masked position holding inf would make inf * 0 = NaN
         nll = torch.where(mask, nll, torch.zeros_like(nll))
         return nll.sum() / mask.float().sum().clamp(min=1)
@@ -702,9 +665,9 @@ class NTPTransformer(nn.Module):
         return logits
 
     def _extract_t2e_predictions(self, log_rate: torch.Tensor) -> torch.Tensor:
-        """Expected time to the next event in days -> [B, T]: the mean of the distribution the
-        loss scores (see t2e_expected_delta)."""
-        return t2e_expected_delta(log_rate, self.t2e_time_resolution_days)
+        """Predicted gap to the next event in days -> [B, T] float64: the median of the
+        distribution the loss scores (see t2e_median_gap)."""
+        return t2e_median_gap(log_rate, self.t2e_interval_offsets)
 
     def forward(self, batch: dict[str, torch.Tensor], hidden_only: bool = False,
                 input_embeds: torch.Tensor | None = None,

@@ -10,5 +10,6 @@ Modules:
     evaluation       next-token test metrics (pipeline 02)
     token_analysis   what the model learned about each vocabulary token (pipeline 02)
     predict          autoregressive generation from anchor-truncated histories (pipeline 03)
+    rollout_metrics  the rollouts scored against the real continuation (pipeline 03)
     explainability   attributing generated tokens to their context (pipeline 03)
 """

@@ -42,11 +42,21 @@ def get_classifiers(
         xgb_params = {
             'objective': 'binary:logistic',
             'eval_metric': 'auc',
-            'max_depth': 6,
-            'learning_rate': 0.1,
+            # Shallow, slowly learning trees, each leaf holding at least 5 units of hessian.
+            # Depth 6 at learning rate 0.1 fit a cohort of a few hundred patients within a
+            # handful of rounds, a coarse step function that lost to the two-column Sex+Age
+            # LR, and min_child_weight 1 let a leaf isolate one up-weighted positive. Every
+            # XGBoost arm gets these, so the arms stay a same-learner comparison.
+            'max_depth': 3,
+            'learning_rate': 0.03,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'min_child_weight': 1,
+            'min_child_weight': 5,
+            # 64 histogram bins per feature instead of XGBoost's default 256. Split finding
+            # on the dense embedding columns runs about 2.3x faster, and on cohorts of a few
+            # thousand patients the finer thresholds bought no measurable AUROC. Every
+            # XGBoost arm gets it.
+            'max_bin': 64,
             # L1 on leaf weights, on top of XGBoost's default L2 (lambda=1), aimed at the
             # bag-of-words arm, whose matrix is as wide as the vocabulary: alpha zeroes out
             # leaf weights whose gain does not clear the penalty, so splits on tokens carried
@@ -124,8 +134,8 @@ def cross_validate_xgboost_classifier(
     y: np.ndarray,
     params: dict,
     n_folds: int = 10,
-    num_boost_round: int = 300,
-    early_stopping_rounds: int = 20,
+    num_boost_round: int = 2000,
+    early_stopping_rounds: int = 30,
     random_state: int = 42,
     scale_pos_weight: float | None = None,
     groups: np.ndarray | None = None
@@ -149,4 +159,4 @@ def cross_validate_xgboost_classifier(
         X, y, y, params, _stratified_folds(X, y, n_folds, random_state, groups), stratify=y,
         fold_metrics=classification_metrics, metric_keys=CV_METRICS, headline=("auc_roc", "AUC"),
         n_folds=n_folds, num_boost_round=num_boost_round,
-        early_stopping_rounds=early_stopping_rounds, random_state=random_state)
+        early_stopping_rounds=early_stopping_rounds, random_state=random_state, groups=groups)

@@ -75,8 +75,7 @@ anchor_columns:
 
 explainability:
   enabled: true
-  num_samples: 20              # most decisive test patients to explain (binary/multiclass: most confident;
-                               # regression/survival: farthest from the median); global importance pools only these
+  num_samples: null            # null = every test prediction; N = a random sample of N (seed 2000), for a faster run
   top_k_tokens: 25
   n_steps: 50                  # Integrated Gradients interpolation steps
-  plot_attention: true
+  plot_attention: true         # cohort attention summaries (explainability/attention_by_*)

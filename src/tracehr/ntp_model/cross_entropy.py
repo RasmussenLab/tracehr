@@ -101,7 +101,7 @@ class CrossEntropyTokenLoss(nn.Module):
     def adjust_coupled_log_rate(
         self, log_rate: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """CE logits already are the per-event log intensities (up to the rate offset)."""
+        """CE logits already are the per-event log intensities (up to the interval offsets)."""
         return log_rate
 
     def forward(

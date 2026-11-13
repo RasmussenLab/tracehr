@@ -68,8 +68,8 @@ and the intervals between them.
 - **Continuous-time modelling.** Event times are represented at minute resolution over the
   full lifespan. Rotary position embeddings can be driven by age instead of token index, so
   that attention depends on the time elapsed between events. Optional Time2Vec embeddings
-  encode age and calendar time, and an optional competing-risks time-to-event objective,
-  following Delphi-2M, models the waiting time to the next event.
+  encode age and calendar time, and an optional competing-risks time-to-event loss objective,
+  inspired by Delphi-2M, models the gap to the next event with a piecewise-constant hazard over eight intervals, from the same minute to more than a year.
 - **Consistent workflow.** All pipelines share the same input format, vocabulary and rule
   for truncating histories at the prediction time, so results are comparable across
   pretraining, probing and fine-tuning.
@@ -78,9 +78,8 @@ and the intervals between them.
   multiclass outcomes additionally by fine-tuning (pipeline 06). Pipeline 05 compares the
   embeddings with demographics-only and bag-of-words XGBoost baselines on identical
   cross-validation folds and test set.
-- **Interpretability.** Integrated gradients and occlusion attribute generated events and
-  fine-tuned predictions to past events. Attention maps and an analysis of the learned token
-  embeddings are also provided.
+- **Interpretability.** Integrated gradients attribute generated events and
+  fine-tuned predictions to past events. Occlusion analysis which drops one event at a time is also used to explain generations. Finetuning pipeline also summarises the attention of its prediction readout, and the model evaluation pipeline analyses the learned token embeddings.
 - **Data integrity.** Patient-level splits are preserved from pretraining to fine-tuning,
   cross-validation is grouped by patient, every patient record is validated with exclusions
   reported, and runs are seeded.
@@ -105,15 +104,15 @@ pip install .            # pip install -e .  for development
   `pip install -U`, as it replaces the installed PyTorch build.
 - **macOS.** Install `libomp` (`brew install libomp`) and set `OMP_NUM_THREADS=1`. PyTorch
   and XGBoost ship separate OpenMP runtimes, which can conflict within one process.
-- **Temporary files.** DuckDB writes temporary files to `./.tmp`, which may contain patient
-  data. Run TracEHR from a project or scratch directory with appropriate access controls.
+- **Temporary files.** DuckDB writes temporary files to `./.tmp_tracehr/<random id>/`, which may contain patient
+  data. It creates one folder per connection these are removed when the connection closes, but a killed run can leave it behind and may need to be deleted by hand. Run TracEHR from a project or scratch directory with appropriate access controls.
 
 ## Quick start
 
 ### 1. Prepare the data
 
 **Events.** A parquet file, or a directory of parquet files, in MEDS format with one row per
-event:
+event. All rows of a patient must exist in the same file.
 
 | subject_id | time | code | type |
 | --- | --- | --- | --- |
@@ -177,11 +176,11 @@ tracehr-finetune  --config my_configs/06_finetune_model.yaml
 | Pipeline | Description | Main outputs |
 | --- | --- | --- |
 | **01** `tracehr-train` | Pretrains the transformer on next-event prediction, optionally with a time-to-event objective. | `best_model.pt`, `latest.pt`, `vocabulary.json`, `training_history.json`, training curves |
-| **02** `tracehr-evaluate` | Evaluates the model on the test set (loss, perplexity, accuracy, top-k accuracy, mean reciprocal rank, and time-to-event error where applicable) and analyses the learned token embeddings. | `test_metrics.json`, `test_metrics.png`, `token_embeddings/` |
-| **03** `tracehr-generate` | Truncates each history at its anchor and generates the next 1–20 events autoregressively, comparing them with the observed continuation; optional attribution of each generated event. | `generations.parquet`, optional `explainability_plots/` |
+| **02** `tracehr-evaluate` | Evaluates the model on the test set (loss, perplexity, accuracy, top-k accuracy, mean reciprocal rank, and time-to-event error where applicable) and analyses the learned token embeddings. | `test_metrics.json`, `test_metrics.png`, `test_metrics_by_target.png`, `token_embeddings/` |
+| **03** `tracehr-generate` | Truncates each history at its anchor and generates the next 1–20 events autoregressively, comparing them with the observed continuation; optional attribution of each generated event. | `generations.parquet`, `test_metrics_by_target.png`, optional `explainability/` |
 | **04** `tracehr-embed` | Extracts a patient embedding at the anchor, or along a time grid to obtain embedding trajectories. | `anchor_embeddings.parquet`, `embedding_extraction_meta.json` |
 | **05** `tracehr-outcome` | Predicts outcomes from frozen embeddings and compares six models with cross-validation and on the test set: demographics only; embeddings with and without demographics, each with a linear model and with XGBoost; and bag-of-words with demographics in XGBoost. | `outcome_summary.json`, `downstream_metrics.json`, `downstream_embeddings.parquet`, ROC/PR and other plots |
-| **06** `tracehr-finetune` | Fine-tunes the model with a task-specific head (binary, multiclass, regression or survival), training the head only, the full model, or both in two phases; optional attribution. | `best_model.pt`, `test_metrics.json`, `predictions.parquet`, `explainability/` |
+| **06** `tracehr-finetune` | Fine-tunes the model with a task-specific head (binary, multiclass, regression or survival), training the head only, the full model, or both in two phases; optional attribution. | `best_model.pt`, `test_metrics.json`, `test_eval`,`training_curves`,`predictions.parquet`, optional `token_attributions.parquet` and `explainability/`|
 
 **Anchors.** Pipelines 03–06 truncate each patient's history at the anchor time (minus
 `time_before_event` days), so that only information available at the prediction time is
@@ -211,7 +210,7 @@ The principal settings in `01_train_model.yaml`:
 | `model.rope_mode` | position encoding in attention: `index` (token position), `age` (time since birth) or `hybrid` (both) |
 | `model.use_time_age`, `model.use_time_abs` | Time2Vec embeddings of age and of calendar time |
 | `model.use_type` | embedding of the event `type` column |
-| `model.t2e_weight` | weight of the time-to-event loss (`0` disables it) |
+| `model.t2e_weight` | weight of the time-to-event loss (`0` disables it). The gap to the next event is scored by its interval (same minute, 1 min–1 h, 1 h–1 d, 1 d–1 wk, 1 wk–1 mo, 1–6 mo, 6 mo–1 y, ≥ 1 y), and the prediction is the median gap. |
 | `model.loss_mode` | token objective: `cross_entropy` or `halo` (see [Token objectives](#token-objectives)) |
 | `sequences.sex_tokens`, `sequences.static_tokens` | codes placed at the start of every sequence |
 
@@ -241,7 +240,7 @@ logo.svg            TracEHR logo
 
 The input is [MEDS](https://medical-event-data-standard.github.io/docs/intro_pages/what_is_MEDS/#meds-data-file-specification)
 data without the metadata files: a parquet file or a directory of parquet shards (read
-recursively), with one row per event. Column names are set in the `columns:` block of each
+recursively), with one row per event. As MEDS requires (subject contiguity), all rows of a patient must be in a single file; a run stops with an error that lists the patients found in more than one file. Column names are set in the `columns:` block of each
 configuration and validated at startup.
 
 | Config key | MEDS column | Type | Rule |
@@ -251,7 +250,7 @@ configuration and validated at startup.
 | `timestamp_col` | `time` | `timestamp[us]` without time zone | null only for sex and static tokens |
 | `type_col` | none (additional column) | string | optional (`null` disables it) |
 
-`numeric_value` and all other columns are ignored.
+`numeric_value` and all other columns are ignored, except that a column named file_index is not allowed: it would hide DuckDB's own file index, which the one-file check relies on.
 
 ### Time
 
@@ -306,7 +305,7 @@ The token objective is selected with `model.loss_mode`:
 | `loss_mode` | Module | Description |
 | --- | --- | --- |
 | `cross_entropy` (default) | `ntp_model/cross_entropy.py` | next-token cross-entropy |
-| `halo` | `ntp_model/halo.py` | distance-to-centroid logits with an abstain class and a radial prior ([4rtemi5/halo](https://github.com/4rtemi5/halo)) |
+| `halo` | `ntp_model/halo.py` | distance-to-centroid logits with an abstain class and a radial prior (experimental) ([4rtemi5/halo](https://github.com/4rtemi5/halo)) |
 
 To add an objective:
 
@@ -345,7 +344,7 @@ modified files are marked as changed.
 
 ## Authors and acknowledgements
 
-TracEHR is written by Foteini Aktypi
+TracEHR is developed by Foteini Aktypi
 ([ORCID 0000-0003-3209-4286](https://orcid.org/0000-0003-3209-4286)) in the
 [Rasmussen Group](https://cbmr.ku.dk/research/research-groups/rasmussen-group/) at the
 Novo Nordisk Foundation Center for Basic Metabolic Research (CBMR), University of
@@ -355,7 +354,7 @@ TracEHR builds on:
 
 - [MEDS](https://medical-event-data-standard.github.io/), the Medical Event Data Standard,
   which defines the input format;
-- Delphi-2M, whose time-to-event formulation TracEHR follows: Shmatko et al., "Learning the
+- Delphi-2M, whose time-to-event formulation TracEHR was inspired by and builds on: Shmatko et al., "Learning the
   natural history of human disease with generative transformers", *Nature* (2025),
   [doi:10.1038/s41586-025-09529-3](https://doi.org/10.1038/s41586-025-09529-3);
-- [4rtemi5/halo](https://github.com/4rtemi5/halo), from which the HALO objective is adapted.
+- [4rtemi5/halo](https://github.com/4rtemi5/halo), from which the HALO objective is adapted (experimental).

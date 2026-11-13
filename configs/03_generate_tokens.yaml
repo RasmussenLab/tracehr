@@ -16,8 +16,12 @@ data:
 # Each prediction step is logged to generations.parquet in output_dir (context seen,
 # position, predicted token, full probability distribution keyed by token string,
 # time provenance). Each step is also compared with the real event at that step of the
-# continuation right after the cutoff (true_token / true_age, correct, cum_accuracy /
-# cum_overlap; empty past the end of the record). The MEDS input is encoded on the fly.
+# continuation right after the cutoff (true_token / true_age / true_token_prob /
+# true_token_rank, correct, cum_accuracy / cum_overlap; empty past the end of the record),
+# and the rollouts are scored with pipeline 02's metrics next to the context copy and the
+# unigram: generation_metrics.json/.txt and the figures generation_tokens_by_step,
+# generation_tokens_by_target and generation_times (400-dpi PNG and SVG; 5-patient rule).
+# The MEDS input is encoded on the fly.
 prediction:
   output_dir: "data/outputs/tokens_only_ce_streaming/generation/"
   batch_size: 64
@@ -25,19 +29,23 @@ prediction:
   raw_parquet_path: "data/synthetic/meds/data"  # MEDS input: a parquet file or a folder of shards
   anchors_path: "data/outputs/comparisons_matched/outcomes_schizophrenia_matched.parquet"  # parquet with patient id + anchor timestamp (target column not needed)
   time_before_event: 0      # same truncation semantics as the evaluation pipeline
-  remove_cutoff_token: true # keep events with time_age < (anchor - time_before_event)
+  remove_cutoff_token: false # true keeps events with time_age < (anchor - time_before_event) (the anchor event is then step 1's real event); false keeps time_age <= (anchor - time_before_event) (the anchor event stays in the prompt)
   allowed_token_names: null # optional list of token names as in the data, e.g. ["e11.9", "death"] (case-insensitive; quote numeric codes): restrict generated tokens to this set; names not in the vocabulary are skipped with a warning; null or [] = no restriction (probs stay full-vocab)
 
-# Optional explainability: attribute every generated token to the context it was generated
-# from. Adds attr_<method> (one signed score per context_tokens entry: the change in
-# log p(generated token), + raises / - lowers) and top_<method> (the strongest supporting
-# events as position/token/score) to generations.parquet. Slower when enabled.
+# Optional explainability: attribute the token generated at step 1 (the prediction at the
+# anchor, from the real history) to the context it was generated from. Adds to the step-1 rows
+# of generations.parquet context_ages, attr_<method> (one signed score per context_tokens entry:
+# the change in log p(generated token), + raises / - lowers) and top_<method> (the events with
+# the largest |score| as position/token/score), and writes cohort summaries to
+# output_dir/explainability/ (aggregates of at least 5 patients): Integrated Gradients by code
+# and by time before the prediction, under pipeline 06's names; occlusion by time before the
+# prediction (time_before_prediction_occlusion: the mean score of one dropped event, last event
+# separately). Slower when enabled.
 explainability:
   enabled: false
-  methods: ["integrated_gradients", "occlusion"]  # one or both
+  methods: ["integrated_gradients", "occlusion"]  # one or both: Integrated Gradients from a zero-vector token baseline | occlusion = the event dropped from the window
   n_steps: 50          # Integrated Gradients interpolation steps
-  top_k_tokens: 10     # events listed in each top_<method>
-  plot_first_k: 0      # plot every generated step of the first K patients into output_dir/explainability_plots (0 = no plots)
+  top_k_tokens: 10     # events listed in each top_<method>, and codes shown in the summary figure
 
 # Column names of the MEDS input (every parquet file is checked against them at startup).
 # time_age and time_abs are computed from timestamp_col.

@@ -16,13 +16,12 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
 from .cohort import load_patient_id_filter
-from .meds_reader import check_patients, event_source, register_ids, to_us, token_type_counts
+from .meds_reader import check_patients, connect, event_source, register_ids, to_us, token_type_counts
 
 # The front-block and time settings a vocabulary records. Window stores and checkpoints
 # fingerprint them together with the token mapping, so data built under other settings is
@@ -146,7 +145,7 @@ def build_vocab(
             f"No training patient in {parquet_path} has usable data, so no vocabulary is built: "
             f"each needs one birth row ({birth_token!r}) with a valid timestamp, at or after "
             f"{earliest_timestamp:%Y-%m-%d}, and no event before it.")
-    con = duckdb.connect()
+    con = connect()
     try:
         source = event_source(con, parquet_path, event_times, ids_col, tok_col, type_col)
         where = register_ids(con, ids, ids_col)
@@ -298,7 +297,7 @@ def unk_token_share(parquet_path: str, ids_path: str, id_col: str, tok_col: str,
     (normalize_tokens). Counts distinct values in DuckDB, so the Python work scales with the
     vocabulary, not the rows."""
     ids = load_patient_id_filter(ids_path)
-    con = duckdb.connect()
+    con = connect()
     try:
         source = event_source(con, parquet_path, event_times, id_col, tok_col, None)
         counts = con.execute(f'SELECT e."{tok_col}", COUNT(*) FROM {source} AS e'

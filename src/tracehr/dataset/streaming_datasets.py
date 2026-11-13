@@ -22,7 +22,6 @@ from .meds_reader import (
     AGE_COL,
     PatientEventReader,
     canonical_sort,
-    duckdb_default_memory_limit,
     parquet_files,
     parquet_id_class,
     stream_patient_sequences,
@@ -38,6 +37,7 @@ from .ntp_batching import (
 from .vocabulary import encode_tokens, encode_types, load_vocab, type_id_map
 from .windows import (
     build_window,
+    count_windows,
     extract_preamble_tokens,
     plan_windows,
     preamble_spec,
@@ -71,25 +71,6 @@ def _sorted_unique_patient_ids(parquet_path: str, id_col: str) -> np.ndarray:
     for batch in scanner.to_batches():
         values.update(batch.column(id_col).to_pylist())
     return np.asarray(sorted(values, key=lambda value: str(value)))
-
-
-def _worker_memory_limit() -> str | None:
-    """DuckDB memory limit for one DataLoader worker's stream: an equal share of DuckDB's own
-    default for one connection (duckdb_default_memory_limit), so the workers together stay
-    within the memory the job may use - the RAM, or a SLURM allocation or container limit when
-    that is smaller - and spill to disk instead. None outside a worker, with a single worker, or
-    when the default can't be read (each worker then gets DuckDB's default)."""
-    worker = get_worker_info()
-    if worker is None or worker.num_workers <= 1:
-        return None
-    total = duckdb_default_memory_limit()
-    if total is None:
-        return None
-    share = total // worker.num_workers // 2 ** 20
-    if worker.id == 0:
-        print(f"[memory] DuckDB limit per DataLoader worker: {share} MB "
-              f"(DuckDB's default {total / 2 ** 30:.1f} GiB over {worker.num_workers} workers)")
-    return f"{share}MB"
 
 
 class RawStreamingNTPDataset(IterableDataset):
@@ -187,7 +168,6 @@ class RawStreamingNTPDataset(IterableDataset):
             self.num_types = 0
 
         self._length: int | None = None
-        self.patient_original_lengths = {}
 
     def __len__(self) -> int:
         """The number of windows of one epoch, counted once by a pass over the data."""
@@ -202,11 +182,18 @@ class RawStreamingNTPDataset(IterableDataset):
         yield from self._shuffle_items(items)
 
     def _worker_patient_ids(self) -> np.ndarray:
-        """The patients this DataLoader worker streams (all of them outside a worker)."""
+        """The patients this DataLoader worker streams (all of them outside a worker). With at
+        least as many input files as workers, each worker takes whole files, so every file is
+        read once; with fewer, every n-th patient."""
         worker = get_worker_info()
         if worker is None:
             return self.patient_ids
-        return self.patient_ids[worker.id::worker.num_workers]
+        if len(self.event_times.file_paths) < worker.num_workers:
+            return self.patient_ids[worker.id::worker.num_workers]
+        births = self.event_times.births
+        mine = births.column("file_index").to_numpy() % worker.num_workers == worker.id
+        ids = births.column(self.id_col).to_numpy(zero_copy_only=False)[mine]
+        return self.patient_ids[np.isin(self.patient_ids, ids)]
 
     def _iter_patient_arrays(self, patient_ids: np.ndarray):
         """(pid, toks, age, abs, types) per patient: one ordered DuckDB stream over these ids,
@@ -214,35 +201,22 @@ class RawStreamingNTPDataset(IterableDataset):
         for pid, tok_vals, age, abs_time, type_vals in stream_patient_sequences(
                 self.parquet_path, self.id_col, self.tok_col, self.time_age_col,
                 self.time_abs_col, self.type_col, ids=np.asarray(patient_ids),
-                event_times=self.event_times, memory_limit=_worker_memory_limit()):
+                event_times=self.event_times):
             toks = encode_tokens(tok_vals, self.stoi, self.unk_id)
             types = encode_types(type_vals, self.type_to_id)
             yield (pid, *canonical_sort(toks, age, abs_time, types))
 
     def _count_windows(self) -> int:
-        """The number of windows of all patients (a pass that plans every patient's windows)."""
-        count = 0
-        for pid, toks, times_age, times_abs, types in self._iter_patient_arrays(self.patient_ids):
-            self.patient_original_lengths[pid] = len(toks)
-            toks, times_age, times_abs, types, _, _ = extract_preamble_tokens(
-                toks, times_age, times_abs, types, self.preamble)
-            if len(toks) < self.min_seq_len:
-                continue
-            count += len(plan_windows(
-                len(toks),
-                self.real_len,
-                self.stride,
-                self.min_seq_len,
-                self.add_final_window,
-                self.start_from_end,
-            ))
-        return count
+        """The number of windows of all patients, counted by the window store's own query."""
+        n_windows, _ = count_windows(
+            self.parquet_path, self.event_times, self.id_col, self.tok_col, self.patient_ids,
+            self.real_len, self.stride, self.min_seq_len, self.add_final_window, self.start_from_end)
+        return n_windows
 
     def _iter_items(self, patient_ids: np.ndarray) -> Iterator[dict]:
         """The training items of these patients' windows, in order."""
         window_index = 0
         for pid, toks, times_age, times_abs, types in self._iter_patient_arrays(patient_ids):
-            self.patient_original_lengths[pid] = len(toks)
             toks, times_age, times_abs, types, preamble, _ = extract_preamble_tokens(
                 toks, times_age, times_abs, types, self.preamble)
 
@@ -503,6 +477,18 @@ class StreamingAnchorsDataset(Dataset):
                 f"{parquet_path} and {len(rows_by_pid)} ids in the anchors table, but "
                 f"none matched. The two id columns likely use different dtypes or id "
                 f"spaces; the dataset would otherwise be silently empty.")
+
+        # Samples in patient-id order (a patient's own in anchor order), whichever input file
+        # held them, so the dataset does not depend on how the input is split into files
+        order = np.argsort(np.asarray(kept_pids), kind="stable")
+        kept_pids = [kept_pids[i] for i in order]
+        targets = [targets[i] for i in order]
+        cutoffs = [cutoffs[i] for i in order]
+        durations = [durations[i] for i in order] if durations else durations
+        new_index = np.empty(len(order), dtype=np.int64)    # old sample index -> new
+        new_index[order] = np.arange(len(order))
+        window_rows = sorted(((int(new_index[pi]), s, e, f) for pi, s, e, f in window_rows),
+                             key=lambda row: row[0])        # stable: a sample's windows stay in order
 
         # One entry per sample (patient, anchor): the patient id and the anchor age
         self.patient_table = np.asarray(kept_pids)

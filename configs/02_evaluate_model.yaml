@@ -22,8 +22,9 @@ data:
   test_ids: "data/synthetic/test_ids.parquet" # patient IDs for the test split (used when streaming)
   test_npz: "data/synthetic/test_windows.npz" # single memory-mapped window store (used when streaming: false); must be built from the checkpoint's vocabulary with overlap_percent=0, add_final_window=False so each test token is scored once (both checked at startup)
 
-# Evaluation settings. All outputs land under output_dir: test_metrics.json (metrics +
-# model provenance), test_metrics.png, and token_embeddings/ when token_analysis is on.
+# Evaluation settings. All outputs land under output_dir: test_metrics.json (metrics, their
+# breakdown by target under by_target, model provenance), test_metrics.png,
+# test_metrics_by_target.png/.svg, and token_embeddings/ when token_analysis is on.
 evaluation:
   batch_size: 4
   output_dir: "data/outputs/tokens_only_ce_streaming/evaluation/"  # Output directory for results

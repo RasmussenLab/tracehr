@@ -11,9 +11,13 @@ num_generated_tokens events (1-20, default 1). Every prediction step is logged t
 generations.parquet: context seen, position, predicted token, the FULL raw
 probability distribution keyed by token string, and the time provenance. Each step is
 also scored against the real continuation right after the prompt (true_token /
-true_age, correct, cum_accuracy / cum_overlap; empty past the end of the record).
-Optional explainability (explainability.enabled) attributes every generated token to
-the context it was generated from (attr_<method> / top_<method> columns, optional plots).
+true_age, correct, cum_accuracy / cum_overlap; empty past the end of the record), and
+the rollouts are scored with pipeline 02's metrics next to the context copy and the
+unigram (generation_metrics.json/.txt and three figures, rollout_metrics).
+Optional explainability (explainability.enabled) attributes the token generated at step 1,
+the prediction at the anchor, to the context it was generated from (context_ages and
+attr_<method> / top_<method> columns), and summarises them over the cohort
+(explainability/, aggregates of at least five patients).
 """
 
 import argparse
@@ -26,7 +30,7 @@ from tracehr.dataset.column_mapping import enabled_col, resolve_anchor_columns, 
 from tracehr.dataset.meds_reader import load_event_times
 from tracehr.dataset.streaming_datasets import StreamingAnchorsDataset
 from tracehr.dataset.vocabulary import load_vocab, type_id_map
-from tracehr.generation.explainability import plot_generated_explanations, resolve_explainability
+from tracehr.generation.explainability import resolve_explainability, summarise_generated_explanations
 from tracehr.generation.model_io import load_checkpoint
 from tracehr.generation.predict import (
     allowed_token_ids_from_names,
@@ -35,6 +39,7 @@ from tracehr.generation.predict import (
     token_modal_types,
     write_generations_parquet,
 )
+from tracehr.generation.rollout_metrics import write_rollout_metrics
 from tracehr.training.runtime import resolve_device
 
 
@@ -77,8 +82,8 @@ def main(config_path: str):
     # Optional explainability, validated before the slow steps (None = off)
     explain = resolve_explainability(config.get("explainability"))
     print("Explainability: off" if explain is None else
-          f"Explainability: on ({', '.join(explain['methods'])}; n_steps={explain['n_steps']}, "
-          f"top_k_tokens={explain['top_k_tokens']}, plot_first_k={explain['plot_first_k']})")
+          f"Explainability: on for step 1 ({', '.join(explain['methods'])}; n_steps={explain['n_steps']}, "
+          f"top_k_tokens={explain['top_k_tokens']})")
 
     print("\nLoading vocabulary...")
     stoi, itos, stats = load_vocab(config["data"]["vocab_path"])
@@ -169,11 +174,14 @@ def main(config_path: str):
 
     _report_continuation(gen_df, n_gen)
 
-    # Plots after the table is saved, so a plotting failure never costs the generations
-    if explain is not None and explain["plot_first_k"] > 0:
-        plot_dir = output_dir / "explainability_plots"
-        n_plots = plot_generated_explanations(gen_df, explain["methods"], explain["plot_first_k"], plot_dir)
-        print(f"Saved {n_plots} explainability plot(s) -> {plot_dir}")
+    # Pipeline 02's metrics on the rollouts, next to the context copy and the unigram
+    # (generation_metrics.json/.txt and figures), after the table is saved
+    write_rollout_metrics(gen_df, stoi, stats, output_dir, allowed_ids)
+
+    # Cohort summaries after the table is saved, so a summary failure never costs the generations
+    if explain is not None:
+        summarise_generated_explanations(gen_df, explain, stats, itos, output_dir)
+        print(f"Saved the explainability summaries -> {output_dir / 'explainability'}")
 
 
 def cli():

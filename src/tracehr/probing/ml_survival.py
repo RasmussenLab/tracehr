@@ -188,11 +188,14 @@ def get_survival_models(
         xgb_params = {
             'objective': 'survival:cox',
             'eval_metric': 'cox-nloglik',
-            'max_depth': 6,
-            'learning_rate': 0.1,
+            # Shallow, slowly learning trees; see get_classifiers for why.
+            'max_depth': 3,
+            'learning_rate': 0.03,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'min_child_weight': 1,
+            'min_child_weight': 5,
+            # 64 histogram bins per feature; see get_classifiers for why.
+            'max_bin': 64,
             # L1 on leaf weights; see get_classifiers for why the wide bag-of-words
             # matrix wants it and what it does (and does not) do.
             'alpha': 1.0,
@@ -246,14 +249,14 @@ def cross_validate_xgboost_survival(
     y: np.ndarray,
     params: dict,
     n_folds: int = 10,
-    num_boost_round: int = 300,
-    early_stopping_rounds: int = 20,
+    num_boost_round: int = 2000,
+    early_stopping_rounds: int = 30,
     random_state: int = 42,
     groups: np.ndarray | None = None
 ) -> tuple[xgb.Booster, dict[str, list[float]]]:
     """k-fold CV of an XGBoost survival:cox model, then a refit on all rows. survival:cox
-    reads one signed label column (to_signed_labels); the inner early-stopping split
-    balances on the event indicator, the quantity the outer folds stratify on. The booster
+    reads one signed label column (to_signed_labels); the inner cross-validation folds
+    balance on the event indicator, the quantity the outer folds stratify on. The booster
     predicts the hazard ratio exp(margin), monotone in the risk score, so the C-index is
     unaffected by the exponential."""
     print_cv_header("XGBoost", n_folds)
@@ -268,4 +271,4 @@ def cross_validate_xgboost_survival(
         X, y, signed, params, _event_folds(X, y, n_folds, random_state, groups),
         stratify=all_events, fold_metrics=survival_metrics, metric_keys=CV_METRICS,
         headline=("cindex", "C-index"), n_folds=n_folds, num_boost_round=num_boost_round,
-        early_stopping_rounds=early_stopping_rounds, random_state=random_state)
+        early_stopping_rounds=early_stopping_rounds, random_state=random_state, groups=groups)

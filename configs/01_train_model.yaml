@@ -3,7 +3,7 @@
 # Hardware settings
 hardware:
   device: "auto"  # "auto", "cuda", "cpu"
-  num_workers: 8
+  num_workers: 8 # As a rule, keep num_workers below the job's core count, the main process needs a core too!
   pin_memory: true
 
 # Data i/o settings

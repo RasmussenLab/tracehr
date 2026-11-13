@@ -94,7 +94,7 @@ def allowed_token_ids_from_names(names, stoi: dict[str, int],
 # ============================================================================ #
 def _time_source(model) -> str | None:
     """How the rollout advances time, reported - three cases, no fabricated signals: "t2e"
-    (the model's expected waiting time), "history_median" (a model that consumes time inputs
+    (the model's median gap), "history_median" (a model that consumes time inputs
     without T2E: each patient's median pre-anchor inter-event gap) or None (a time-free
     model: the times are NaN).
 
@@ -203,13 +203,16 @@ def generate_tokens(
     full history). One row per prediction step per prompt; `probs` holds the FULL vocabulary softmax
     as {token string: prob} (selection masking never alters it). true_token / true_age
     are the real event at this step of the continuation right after the prompt (filtered
-    to allowed_token_ids when set; None / NaN past the end of the record). With `explain` (the
-    settings from explainability.resolve_explainability) each row also gets
-    attr_<method> / top_<method>: the generated token attributed to the exact window
-    that produced it (see explainability.explain_generated).
+    to allowed_token_ids when set; None / NaN past the end of the record), and
+    true_token_prob / true_token_rank its probability in `probs` and its rank under the full
+    distribution (as pipeline 02 ranks a target; NaN / <NA> without a real event). With
+    `explain` (the settings from explainability.resolve_explainability) each step-1 row also
+    gets context_ages and attr_<method> / top_<method>: the token generated at the anchor
+    attributed to the exact window that produced it (see explainability.explain_generated);
+    the later steps, which read the model's own generated events, are not explained.
     Time handling:
-    t2e active -> each step advances by the model's expected waiting time (the mean of the
-    grid distribution its loss scores, t2e_expected_delta);
+    t2e active -> each step advances by the model's median gap (the median of the interval
+    distribution its loss scores, t2e_median_gap);
     time-free model -> NaN times; time inputs without t2e -> the patient's median
     pre-anchor inter-event gap (cohort median fallback) as an honest workaround.
     """
@@ -251,11 +254,19 @@ def generate_tokens(
             abstain = _abstain_prob(model, logits)                       # [B] or None
             abstain = abstain.cpu().numpy() if abstain is not None else None
             picks = (logits + sel_mask).argmax(dim=-1).cpu().numpy()     # masked selection only
+            # Each prompt's real event at this step, and its rank under the full distribution
+            # as pipeline 02 ranks a target: 1 + the tokens with a higher logit
+            truths = [p["future"][step - 1] if step <= len(p["future"]) else (None, float("nan"))
+                      for p in chunk]
+            true_ids = torch.tensor([t if t is not None else 0 for t, _ in truths], device=device)
+            true_ranks = (1 + (logits > logits.gather(1, true_ids.unsqueeze(1))).sum(dim=-1)).cpu().numpy()
             deltas = (out["predicted_time_delta"][bidx, last].cpu().numpy()
                       if time_source == "t2e" else None)
-            # Optional explainability: each pick attributed to the window that produced it
-            attributions = (explain_generated(model, batch, last, picks, itos, explain, batch_size)
-                            if explain is not None else None)
+            # Optional explainability: step 1's picks, the predictions at the anchor from the
+            # real history, attributed to the window that produced them
+            attributions = (explain_generated(model, batch, np.stack([w[1] for w in wins]), last, picks,
+                                              itos, explain, batch_size)
+                            if explain is not None and step == 1 else None)
 
             for j, p in enumerate(chunk):
                 tok = int(picks[j])
@@ -268,7 +279,7 @@ def generate_tokens(
                 new_age = p["ages"][-1] + dt if dt is not None else float("nan")
                 new_abs = p["abss"][-1] + dt if dt is not None else float("nan")
                 win_real = int(attn[j].sum())
-                true_tok, true_age = p["future"][step - 1] if step <= len(p["future"]) else (None, float("nan"))
+                true_tok, true_age = truths[j]
                 rows.append({
                     "patient_id": str(p["pid"]),
                     "anchor_age": p["anchor_age"],
@@ -278,6 +289,8 @@ def generate_tokens(
                     "predicted_token_id": tok,
                     "predicted_token": itos[tok],
                     "true_token": itos[true_tok] if true_tok is not None else None,
+                    "true_token_prob": float(probs[j, true_tok]) if true_tok is not None else float("nan"),
+                    "true_token_rank": int(true_ranks[j]) if true_tok is not None else None,
                     "probs": dict(zip(itos, probs[j].tolist())),
                     "predicted_time_delta": dt if dt is not None else float("nan"),
                     "generated_age": new_age,
@@ -291,7 +304,10 @@ def generate_tokens(
                 p["abss"].append(new_abs if dt is not None else (p["abss"][-1] if p["abss"] else 0.0))
                 p["typs"].append(int(type_lookup[tok]) if type_lookup is not None else 0)
 
-    return pd.DataFrame(rows)
+    gen_df = pd.DataFrame(rows)
+    if rows:   # the rank stays an integer, <NA> where the step has no real event
+        gen_df["true_token_rank"] = gen_df["true_token_rank"].astype("Int64")
+    return gen_df
 
 
 # ============================================================================ #

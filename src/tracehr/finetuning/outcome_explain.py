@@ -1,232 +1,60 @@
 # src/tracehr/finetuning/outcome_explain.py
-"""Explainability for NTPOutcomeModel (regression | binary | multiclass | survival).
-Three complementary views, all attributing the head's raw scalar (binary: event logit;
-multiclass: the predicted class's logit; regression: the predicted value; survival: the log
-relative risk) against an all-<PAD> token baseline with the event times and types kept, so
-only token identity is attributed:
+"""Explainability for NTPOutcomeModel (regression | binary | multiclass | survival), run by
+pipeline 06 on the test split: every test prediction, or a seeded random sample of them. Each
+explained prediction gets one row per position of its window, holding:
   1. Integrated Gradients on the token input embeddings (stage 03's integrated_gradients
-     applied to the head's scalar) -> per-token, per-sample signed attributions
-     (token_attributions.parquet, joined to predictions.parquet on patient_id + anchor_age;
-     completeness_residual = a sample's attributions minus its output change, the n_steps
-     discretisation error) and a signed bar plot per sample.
-  2. Cohort summary: signed attributions pooled by token across the explained
-     samples (per explained class for multiclass) -> SHAP-style beeswarm
-     (global_token_importance.png/.json; multiclass: global_token_importance_class{k}.png/.json).
-     Figure and json hold the same tokens: those seen in at least min_patients distinct patients.
-  3. Final-layer attention heatmaps over each explained sample's most recent events
-     (complementary diagnostic).
+     applied to the head's raw scalar: binary event logit, multiclass predicted-class logit,
+     regression value, survival log relative risk) against a zero-vector token baseline with the
+     event times and types kept, so only token identity is attributed; completeness_residual =
+     the prediction's attributions minus its output change (the n_steps discretisation error);
+  2. with plot_attention, its readout attention per layer (readout_attention) and the uniform
+     reference.
+The rows go to <output_dir>/token_attributions.parquet (patient level, joined to
+predictions.parquet on patient_id + anchor_age); explain_summary turns them into the cohort
+tables and figures of <output_dir>/explainability/, which hold aggregates only.
 """
 
-import json
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
-from ..generation.attribution import NEGATIVE_COLOR, POSITIVE_COLOR, integrated_gradients
-from ..training.runtime import batch_to_device, resolve_device
+from ..generation.attribution import integrated_gradients
+from ..training.runtime import ProgressLog, batch_to_device, resolve_device
+from .explain_summary import SEED, _unit, summarise_explanations
+from .finetune_plots import MIN_PATIENTS, HIDDEN
 
-# ============================================================================ #
-# Plots
-# ============================================================================ #
-# What a positive / negative signed attribution pushes the explained output toward.
-# Multiclass is per explained class (_direction).
-_DIRECTION = {
-    "binary": ("event", "no event"),
-    "regression": ("higher prediction", "lower prediction"),
-    "survival": ("higher risk", "lower risk"),
+# Files earlier versions of pipeline 06 wrote into explainability/: per-patient figures, and
+# the patient-level attributions now written one level up
+OLD_INDIVIDUAL_FILES = ("sample_*_importance.png", "sample_*_attn.png",
+                        "global_token_importance*.png", "global_token_importance*.json",
+                        "token_attributions.parquet")
+# The query weights r_t of readout_attention, per pooling (recorded in explainability.json)
+_READOUT = {
+    "last": "the last position",
+    "mean": "every position equally",
+    "attention": "the head's learned pooling weights",
+    "max": "every position equally (max pooling has no single weight per position)",
 }
+_ATTENTION_NOTE = ("Attention shows where the information the head reads comes from, not how much "
+                   "it changes the output; after layer 0 every position already mixes in the events "
+                   "before it. Integrated Gradients is the attribution; attention complements it.")
 
 
-def _direction(task: str, target: int | None) -> tuple[str, str]:
-    """(positive, negative) labels of one explanation; target is the explained class
-    (multiclass), else None."""
-    return _DIRECTION[task] if target is None else (f"class {target}", f"away from class {target}")
-
-
-def plot_token_importance(
-    token_ids: np.ndarray,
-    attributions: np.ndarray,
-    vocab: dict[int, str],
-    title: str,
-    top_k: int = 20,
-    save_path: str | None = None,
-    direction: tuple[str, str] = ("event", "no event"),
-):
-    """Bar plot of one sample's top_k events by |attribution|, drawn signed (direction names
-    what the positive and negative sides push toward), saved to save_path when given. Each
-    label carries the event's position (as in token_attributions.parquet), so a code
-    recorded several times stays apart."""
-    import matplotlib.pyplot as plt
-
-    order = np.argsort(-np.abs(attributions), kind="stable")[:top_k]
-    names = [f"{vocab.get(int(token_ids[i]), f'tok_{token_ids[i]}')} [{i}]" for i in order]
-    scores = attributions[order]
-
-    fig, ax = plt.subplots(figsize=(10, max(6, len(order) * 0.4)))
-    ax.barh(range(len(order)), scores, color=[POSITIVE_COLOR if s >= 0 else NEGATIVE_COLOR for s in scores])
-    ax.set_yticks(range(len(order)))
-    ax.set_yticklabels(names, fontsize=9)
-    ax.invert_yaxis()
-    ax.axvline(x=0, color="gray", linestyle="-", linewidth=0.8)
-    pos, neg = direction
-    ax.set_xlabel(f"Signed Importance  (positive → {pos}, negative → {neg})", fontsize=11)
-    ax.set_title(title)
-    plt.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_global_token_importance(
-    token_importances: dict[str, list[float]],
-    horizon_name: str,
-    top_k: int = 20,
-    save_path: str | None = None,
-    max_points_per_token: int = 300,
-    direction: tuple[str, str] = ("event", "no event"),
-):
-    """SHAP-style beeswarm plot showing global signed token importance.
-
-    Each dot represents one occurrence of a token across the explained samples.
-    Position on the x-axis shows signed importance (positive = pushes the
-    explained output toward direction[0], negative = toward direction[1]).
-    Tokens are ranked on the y-axis by mean |importance|.
-
-    Args:
-        token_importances: {token_name: [signed_importance_values]}, only the tokens that may
-            be shown (the caller applies the patient threshold)
-        horizon_name: Label for the prediction horizon (used in title)
-        top_k: Number of top tokens to display
-        save_path: Where to save the plot
-        max_points_per_token: Sub-sample per row to avoid over-plotting
-        direction: (positive, negative) labels for the x-axis and legend
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
-
-    filtered = {k: np.array(v) for k, v in token_importances.items()}
-    if not filtered:
-        print(f"  No tokens to plot for {horizon_name}")
-        return
-
-    # Rank by mean |importance|
-    mean_abs = {k: np.mean(np.abs(v)) for k, v in filtered.items()}
-    sorted_tokens = sorted(mean_abs.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    # Reverse so most important is at the top of the plot
-    token_names = [t[0] for t in sorted_tokens][::-1]
-
-    fig, ax = plt.subplots(figsize=(10, max(6, len(token_names) * 0.4)))
-
-    rng = np.random.RandomState(42)
-
-    for row_idx, name in enumerate(token_names):
-        values = filtered[name]
-        if len(values) > max_points_per_token:
-            indices = rng.choice(len(values), max_points_per_token, replace=False)
-            values = values[indices]
-
-        y_jitter = rng.uniform(-0.3, 0.3, size=len(values))
-        y_positions = row_idx + y_jitter
-
-        colors = [POSITIVE_COLOR if v >= 0 else NEGATIVE_COLOR for v in values]
-        ax.scatter(values, y_positions, c=colors, alpha=0.35, s=8, edgecolors='none')
-
-    ax.set_yticks(range(len(token_names)))
-    ax.set_yticklabels(token_names, fontsize=9)
-    ax.axvline(x=0, color='gray', linestyle='-', linewidth=0.8)
-    pos, neg = direction
-    ax.set_xlabel(f"Signed Importance  (positive → {pos}, negative → {neg})", fontsize=11)
-    ax.set_title(f"Global Token Importance — {horizon_name}", fontsize=13)
-    ax.grid(True, axis='x', alpha=0.3)
-
-    legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=POSITIVE_COLOR,
-               markersize=8, label=f'Positive (→ {pos})'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor=NEGATIVE_COLOR,
-               markersize=8, label=f'Negative (→ {neg})'),
-    ]
-    ax.legend(handles=legend_elements, loc='lower right', fontsize=9)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-
-
-def plot_attention_heatmap(
-    attention: torch.Tensor,
-    attention_mask: torch.Tensor,
-    layer: int = -1,
-    head: int | None = None,
-    vocab: dict[int, str] | None = None,
-    token_ids: torch.Tensor | None = None,
-    title: str | None = None,
-    save_path: str | None = None,
-    figsize: tuple[int, int] = (10, 10),
-    max_tokens: int = 50,
-):
-    """Heatmap of one layer's attention ([H, T, T]: head `head`, or the mean over the heads;
-    [T, T] as is) over the last max_tokens real positions, labeled with the token names when
-    vocab and token_ids are given (else the positions), saved to save_path when given.
-    layer only labels the title."""
-    import matplotlib.pyplot as plt
-
-    valid = attention_mask.bool().cpu()
-    n_valid = valid.sum().item()
-    n_show = min(n_valid, max_tokens)
-    # The last n_show real positions (windows are right-padded): the events nearest the
-    # prediction point, not the oldest ones at the start of the window
-    shown = slice(n_valid - n_show, n_valid)
-
-    if attention.dim() == 3:
-        # [H, T, T] – pick a head or average
-        if head is not None:
-            attn = attention[head, shown, shown].cpu().numpy()
-            title = title or f"Layer {layer}, Head {head}"
-        else:
-            attn = attention.mean(dim=0)[shown, shown].cpu().numpy()
-            title = title or f"Layer {layer}, Average over heads"
-    else:
-        attn = attention[shown, shown].cpu().numpy()
-        title = title or "Attention map"
-
-    # Token labels
-    if token_ids is not None and vocab is not None:
-        ids = token_ids[shown].cpu().numpy()
-        labels = [vocab.get(int(i), f"{i}") for i in ids]
-    else:
-        labels = [str(i) for i in range(shown.start, shown.stop)]
-
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(attn, cmap="Blues", aspect="auto")
-    ax.set_xticks(range(n_show))
-    ax.set_yticks(range(n_show))
-    ax.set_xticklabels(labels, rotation=90, fontsize=7)
-    ax.set_yticklabels(labels, fontsize=7)
-    ax.set_xlabel("Key")
-    ax.set_ylabel("Query")
-    ax.set_title(title)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
+def old_individual_files(expl_dir) -> list[Path]:
+    """The files of OLD_INDIVIDUAL_FILES in expl_dir."""
+    return sorted(p for pattern in OLD_INDIVIDUAL_FILES for p in Path(expl_dir).glob(pattern))
 
 
 # ============================================================================ #
-# Attribution, attention and the patients to explain
+# Attribution and attention of one prediction
 # ============================================================================ #
 def integrated_gradients_signed(model, batch: dict[str, torch.Tensor], n_steps: int = 50,
                                 target_index: int | None = None, batch_size: int = 64) -> np.ndarray:
     """Signed Integrated Gradients per input token for a single-sample batch.
 
-    Stage 03's integrated_gradients (all-<PAD> token baseline, midpoint rule, path points
+    Stage 03's integrated_gradients (zero-vector token baseline, midpoint rule, path points
     run batch_size at a time, gradients w.r.t. the path embeddings only) attributing the
     head's scalar: interpolated embeddings go through the backbone (its forward with
     input_embeds), pooling, and the task head. Multiclass attributes the logit of
@@ -254,72 +82,64 @@ def integrated_gradients_signed(model, batch: dict[str, torch.Tensor], n_steps: 
 
 
 @torch.no_grad()
-def _capture_attentions(model, batch: dict[str, torch.Tensor]) -> list[torch.Tensor]:
-    """Per-layer causal attention weights [B, H, T, T] of one forward, from the backbone's own
-    attention capture; the backbone's previous capture setting is restored afterwards."""
+def readout_attention(model, sample: dict[str, torch.Tensor]) -> tuple[np.ndarray, np.ndarray]:
+    """([L, T] readout attention per layer, [T] uniform reference) of one window trimmed to its
+    T real positions (sample: [1, T] tensors).
+
+    The readout attention on position j in layer l is sum_t r_t A_l[t, j]: A_l is the layer's
+    causal attention averaged over its heads, and r_t how much query position t feeds the pooled
+    vector the head reads (_READOUT). Every row of A_l sums to 1 over the keys its query sees,
+    so the readout attention sums to 1. The uniform reference is the same sum with every query
+    spreading its attention evenly over what it sees. The backbone's attention capture is
+    restored afterwards."""
     backbone = model.backbone
     was_capturing = backbone.store_attn
     backbone.enable_attention_capture(True)
     try:
         model.eval()
-        model(batch)
-        return backbone.get_attention_maps()
+        hidden = backbone(sample, hidden_only=True)["hidden_states"][0]                  # [T, D]
+        attn = torch.stack([m[0].mean(dim=0) for m in backbone.get_attention_maps()])    # [L, T, T]
     finally:
         backbone.enable_attention_capture(was_capturing)
+    T = hidden.size(0)
+    if model.pooling == "last":
+        r = torch.zeros(T, device=hidden.device)
+        r[-1] = 1.0
+    elif model.pooling == "attention":
+        r = (hidden @ model.head.pool_score).softmax(dim=0)
+    else:                                                      # mean; max has no single weight
+        r = torch.full((T,), 1.0 / T, device=hidden.device)
+    uniform = (torch.ones(T, T, device=hidden.device).tril()
+               / torch.arange(1, T + 1, device=hidden.device).unsqueeze(1))
+    return (r @ attn).float().cpu().numpy(), (r @ uniform).float().cpu().numpy()
 
 
-@torch.no_grad()
-def _collect_predictions(model, loader, device, task) -> dict[str, np.ndarray]:
-    """One batched pass: per-sample prediction, label, and a confidence score
-    used to pick the most decisive samples to explain."""
-    model.eval()
-    preds, labels, conf = [], [], []
-    for batch in loader:
-        batch = batch_to_device(batch, device)
-        out = model(batch)
-        if task in ("survival", "regression"):
-            # A risk score or a predicted value has no decision threshold, so "decisive"
-            # means far from the middle of the cohort's predictions: clearly high or clearly
-            # low. Centred below on the median of the whole cohort (robust to a long tail),
-            # once every batch is in; a batch's median would rank samples against whatever
-            # shares their batch.
-            preds.append(out["predictions"].cpu().numpy())
-        elif task == "binary":
-            p = out["probs"].cpu().numpy()
-            preds.append(p)
-            conf.append(np.abs(p - 0.5))
-        else:  # multiclass
-            p = out["probs"].cpu().numpy()
-            preds.append(p.argmax(axis=-1))
-            conf.append(p.max(axis=-1))
-        labels.append(batch["labels"].cpu().numpy())
-    preds = np.concatenate(preds)
-    if task in ("survival", "regression"):
-        confidence = np.abs(preds - np.median(preds))
-    else:
-        confidence = np.concatenate(conf)
-    return {"preds": preds, "labels": np.concatenate(labels), "confidence": confidence}
-
-
-def _explain_sample(model, batch: dict[str, torch.Tensor], idx: int, rank: int, *,
-                    target: int | None, pid: str, anchor: float, task: str,
-                    vocab_itos: dict[int, str], n_steps: int, batch_size: int, top_k_tokens: int,
-                    plot_attention: bool, expl_dir: Path) -> list[dict]:
-    """The token-attribution rows of one explained sample (one per position), with its signed
-    bar plot and, with plot_attention, its final-layer attention heatmap. target is the class
-    IG explains (multiclass), else None."""
+def _explain_sample(model, batch: dict[str, torch.Tensor], idx: int, *, target: int | None,
+                    pid: str, anchor: float, vocab_itos: dict[int, str], front_ids: set[int],
+                    n_steps: int, batch_size: int, with_attention: bool) -> list[dict]:
+    """The rows of one explained prediction, one per position of its window: the token, its
+    age, its signed attribution, the prediction's completeness residual, whether the position
+    is in the front block (SOS/CON, sex, static) and, with with_attention, its readout attention
+    per layer and the uniform reference. target is the class IG explains (multiclass), else
+    None."""
     signed = integrated_gradients_signed(model, batch, n_steps=n_steps, target_index=target,
                                          batch_size=batch_size)
-    # Completeness: the attributions sum to the explained output's change from the all-<PAD>
-    # baseline (times and types kept), up to the n_steps discretisation error recorded here
-    pad_batch = {**batch, "input_ids": torch.full_like(batch["input_ids"], model.backbone.pad_id)}
+    # Completeness: the attributions sum to the explained output's change from the zero-vector
+    # token baseline (times and types kept), up to the n_steps discretisation error recorded here
     k = target if target is not None else 0               # the head output IG explains
+    rows = {key: v for key, v in batch.items() if key != "labels"}
     with torch.no_grad():
-        change = model.head(model(batch)["pooled"])[0, k] - model.head(model(pad_batch)["pooled"])[0, k]
+        zero = torch.zeros_like(model.backbone.tok(rows["input_ids"]))
+        hidden = model.backbone(rows, hidden_only=True, input_embeds=zero)["hidden_states"]
+        baseline = model.head(model._pool_hidden_states(hidden, rows["attention_mask"]))[0, k]
+        change = model.head(model(batch)["pooled"])[0, k] - baseline
     residual = float(signed.sum()) - change.item()
     seq_len = len(signed)
     ids = batch["input_ids"][0, :seq_len].cpu().numpy()
     ages = batch["time_age"][0, :seq_len].cpu().numpy() if "time_age" in batch else np.full(seq_len, np.nan)
+    if with_attention:
+        attention, uniform = readout_attention(
+            model, {key: v[:1, :seq_len] for key, v in batch.items() if key != "labels"})
 
     rows = []
     for pos in range(seq_len):
@@ -335,60 +155,14 @@ def _explain_sample(model, batch: dict[str, torch.Tensor], idx: int, rank: int, 
         }
         if target is not None:
             row["target_class"] = target
-        row["anchor_age"] = anchor  # last, so every earlier column keeps its position
+        row["anchor_age"] = anchor  # then the newer columns, so every earlier one keeps its position
+        row["front_block"] = int(ids[pos]) in front_ids
+        if with_attention:
+            for layer in range(len(attention)):
+                row[f"attention_layer{layer}"] = float(attention[layer, pos])
+            row["attention_uniform"] = float(uniform[pos])
         rows.append(row)
-
-    plot_token_importance(
-        ids, signed, vocab_itos, title=f"Patient {pid}, anchor {anchor:g} | top token attributions",
-        top_k=top_k_tokens, direction=_direction(task, target),
-        save_path=str(expl_dir / f"sample_{rank+1}_{pid}_importance.png"),
-    )
-    if plot_attention:
-        attns = _capture_attentions(model, batch)
-        if attns:
-            plot_attention_heatmap(
-                attns[-1][0].cpu(), batch["attention_mask"][0].cpu(), layer=len(attns) - 1,
-                vocab=vocab_itos, token_ids=batch["input_ids"][0].cpu(),
-                title=f"Patient {pid}, anchor {anchor:g} | final-layer attention, most recent events",
-                save_path=str(expl_dir / f"sample_{rank+1}_{pid}_attn.png"),
-            )
     return rows
-
-
-def _write_cohort_summaries(cohorts: dict, cohort_patients: dict, *, task: str, n_explain: int,
-                            explained_preds: np.ndarray, min_patients: int, top_k_tokens: int,
-                            expl_dir: Path) -> None:
-    """The cohort summary: a signed beeswarm and a json ranked by mean |attribution|.
-    Multiclass gets one summary per explained class; other tasks the single group None, which
-    keeps the unsuffixed file names (and still writes them when no sample was explained).
-    explained_preds holds the explained samples' predictions, in explanation order."""
-    groups = sorted(cohorts) if task == "multiclass" else [None]
-    for target in groups:
-        # Only tokens seen in at least min_patients distinct patients, in the figure and the json
-        # alike, so both rank the same tokens and none seen in fewer patients is reported
-        patients = cohort_patients[target]
-        cohort = {name: v for name, v in cohorts[target].items() if len(patients[name]) >= min_patients}
-        suffix = "" if target is None else f"_class{target}"
-        # The summary pools only the explained samples (multiclass: those predicted this class)
-        n = n_explain if target is None else int((explained_preds == target).sum())
-        plot_global_token_importance(
-            cohort, horizon_name=(task if target is None else f"{task}, class {target}")
-                                 + f" ({n} most decisive samples)",
-            top_k=top_k_tokens,
-            save_path=str(expl_dir / f"global_token_importance{suffix}.png"),
-            direction=_direction(task, target),
-        )
-        summary = {
-            name: {
-                "mean_abs": float(np.mean(np.abs(v))),
-                "mean_signed": float(np.mean(v)),
-                "n_occurrences": len(v),
-                "n_patients": len(patients[name]),
-            }
-            for name, v in sorted(cohort.items(), key=lambda x: np.mean(np.abs(x[1])), reverse=True)[:top_k_tokens * 2]
-        }
-        with open(expl_dir / f"global_token_importance{suffix}.json", "w") as f:
-            json.dump(summary, f, indent=2)
 
 
 # ============================================================================ #
@@ -401,68 +175,94 @@ def explain_outcome_predictions(
     task: str,
     output_dir: str,
     collate_fn,
-    num_samples: int = 20,
+    *,
+    vocab_stats: dict,
+    num_samples: int | None = None,
     top_k_tokens: int = 25,
     n_steps: int = 50,
     batch_size: int = 64,
     device: str = "auto",
     plot_attention: bool = True,
-    min_patients: int = 5,
+    min_patients: int = MIN_PATIENTS,
+    evaluated_model: dict | None = None,
 ) -> pd.DataFrame:
-    """Integrated-Gradients + cohort-summary + attention explainability.
+    """Integrated Gradients (and, with plot_attention, readout attention) for the predictions
+    of dataset: all of them (num_samples None), or num_samples drawn at random (seed SEED).
 
-    Explains the `num_samples` most confident/extreme samples, writes
-    per-token signed attributions, a SHAP-style global token-importance plot
-    (one per explained class for multiclass), and per-sample signed attribution
-    bars and attention heatmaps into `<output_dir>/explainability/`. The cohort
-    summary (plot and json) keeps only tokens seen in at least `min_patients`
-    distinct patients. Returns the token-attributions dataframe.
-    """
+    Writes the per-position rows to <output_dir>/token_attributions.parquet (patient level) and
+    their cohort summaries to <output_dir>/explainability/ (summarise_explanations: aggregates
+    of at least min_patients patients, top_k_tokens codes per figure, explainability.json with
+    the settings and evaluated_model, the record of the weights explained). Files of earlier
+    versions in explainability/ (OLD_INDIVIDUAL_FILES) are deleted once the new parquet is
+    written. vocab_stats (load_vocab's) names the structural and front-block tokens. Returns the
+    rows."""
     device = torch.device(resolve_device(device))
     model = model.to(device).eval()
-
     expl_dir = Path(output_dir) / "explainability"
-    expl_dir.mkdir(parents=True, exist_ok=True)
 
+    special = vocab_stats["special_tokens"]
+    structural = set(special)
+    front_ids = {special[t] for t in ("<SOS>", "<CON>") if t in special}
+    front_ids |= set(vocab_stats.get("sex_token_ids", [])) | set(vocab_stats.get("static_token_ids", []))
     patient_ids = getattr(dataset, "patient_ids", None)
     # Each sample's own anchor (a patient may have several): with patient_id, the key of its
     # row in predictions.parquet
     anchor_ages = getattr(dataset, "anchor_ages", None)
 
-    # Rank the samples by prediction confidence, then explain the top ones.
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    stats = _collect_predictions(model, loader, device, task)
-    n_explain = min(num_samples, len(dataset))
-    order = np.argsort(-stats["confidence"])[:n_explain]
-
+    n = len(dataset)
+    chosen = (np.arange(n) if num_samples is None or num_samples >= n
+              else np.sort(np.random.default_rng(SEED).choice(n, num_samples, replace=False)))
+    print(f"[explain] Integrated Gradients on {len(chosen)} of {n} test predictions (n_steps={n_steps})...")
     rows = []
-    # token_name -> [signed attributions]; multiclass keeps one cohort per explained class
-    # (attributions toward different classes share no sign), other tasks the single key None
-    cohorts = defaultdict(lambda: defaultdict(list))
-    cohort_patients = defaultdict(lambda: defaultdict(set))  # same keys -> {distinct patient ids}
-    print(f"[explain] Integrated Gradients on {n_explain} samples (n_steps={n_steps})...")
-    for rank, idx in enumerate(order):
-        batch = batch_to_device(collate_fn([dataset[int(idx)]]), device)
-        target = int(stats["preds"][idx]) if task == "multiclass" else None  # class IG explains
-        pid = str(patient_ids[int(idx)]) if patient_ids is not None else str(int(idx))
-        anchor = float(anchor_ages[int(idx)]) if anchor_ages is not None else float("nan")
-        sample_rows = _explain_sample(model, batch, int(idx), rank, target=target, pid=pid,
-                                      anchor=anchor, task=task, vocab_itos=vocab_itos,
-                                      n_steps=n_steps, batch_size=batch_size,
-                                      top_k_tokens=top_k_tokens, plot_attention=plot_attention,
-                                      expl_dir=expl_dir)
-        for row in sample_rows:
-            cohorts[target][row["token"]].append(row["attribution"])
-            cohort_patients[target][row["token"]].add(pid)
-        rows.extend(sample_rows)
+    for idx in ProgressLog(chosen, "[explain]"):
+        idx = int(idx)
+        batch = batch_to_device(collate_fn([dataset[idx]]), device)
+        target = None
+        if task == "multiclass":           # each prediction is explained for its predicted class
+            with torch.no_grad():
+                target = int(model(batch)["logits"].argmax(dim=-1)[0].item())
+        pid = str(patient_ids[idx]) if patient_ids is not None else str(idx)
+        anchor = float(anchor_ages[idx]) if anchor_ages is not None else float("nan")
+        rows.extend(_explain_sample(model, batch, idx, target=target, pid=pid, anchor=anchor,
+                                    vocab_itos=vocab_itos, front_ids=front_ids, n_steps=n_steps,
+                                    batch_size=batch_size, with_attention=plot_attention))
 
     attributions = pd.DataFrame(rows)
-    attributions.to_parquet(expl_dir / "token_attributions.parquet", index=False)
-    _write_cohort_summaries(cohorts, cohort_patients, task=task, n_explain=n_explain,
-                            explained_preds=stats["preds"][order], min_patients=min_patients,
-                            top_k_tokens=top_k_tokens, expl_dir=expl_dir)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    attributions.to_parquet(Path(output_dir) / "token_attributions.parquet", index=False)
+    for old in old_individual_files(expl_dir):
+        old.unlink()
+        print(f"[explain] deleted {old.name}, an individual-level file of an earlier run")
 
-    worst = max((abs(r["completeness_residual"]) for r in rows), default=0.0)
+    worst = float(attributions["completeness_residual"].abs().max()) if rows else 0.0
+    test_patients = len(set(map(str, patient_ids))) if patient_ids is not None else n
+    explained_patients = attributions["patient_id"].nunique() if rows else 0
+    backbone_config = model.backbone.config
+    meta = {
+        "task": task,
+        "explained_output": _unit(task, None) if task != "multiclass" else "each prediction's own class logit",
+        "selection": ("all test predictions" if len(chosen) == n
+                      else f"{len(chosen)} test predictions drawn at random, seed {SEED}"),
+        # 5-patient rule: a count of predictions from fewer than min_patients patients is hidden
+        "n_test_predictions": n if test_patients >= min_patients else HIDDEN,
+        "n_explained_predictions": len(chosen) if explained_patients >= min_patients else HIDDEN,
+        "n_explained_patients": explained_patients if explained_patients >= min_patients else HIDDEN,
+        "n_steps": n_steps,
+        "max_abs_completeness_residual": worst,
+        "structural_tokens": sorted(structural),
+        "structural_share_of_abs_attribution": (
+            float(attributions.loc[attributions["token"].isin(structural), "abs_attribution"].sum()
+                  / attributions["abs_attribution"].sum()) if rows else None),
+        "pooling": model.pooling,
+        "evaluated_model": evaluated_model,
+    }
+    if plot_attention:
+        meta.update({"readout_attention_queries": _READOUT[model.pooling],
+                     "n_layers": backbone_config.n_layers, "n_heads": backbone_config.n_heads,
+                     "attention_note": _ATTENTION_NOTE})
+    summarise_explanations(attributions, task=task, out_dir=expl_dir, structural=structural,
+                           meta=meta, min_patients=min_patients, top_k=top_k_tokens)
+
     print(f"[explain] IG completeness: largest |residual| {worst:.2e} (raise n_steps if not small)")
-    print(f"[explain] Wrote token attributions + global importance to {expl_dir}")
+    print(f"[explain] Wrote {Path(output_dir) / 'token_attributions.parquet'} and the summaries in {expl_dir}")
     return attributions

@@ -40,11 +40,14 @@ def get_regressors(
         xgb_params = {
             'objective': 'reg:squarederror',
             'eval_metric': 'rmse',
-            'max_depth': 6,
-            'learning_rate': 0.1,
+            # Shallow, slowly learning trees; see get_classifiers for why.
+            'max_depth': 3,
+            'learning_rate': 0.03,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
-            'min_child_weight': 1,
+            'min_child_weight': 5,
+            # 64 histogram bins per feature; see get_classifiers for why.
+            'max_bin': 64,
             # L1 on leaf weights; see get_classifiers for why the wide bag-of-words matrix
             # wants it and what it does (and does not) do.
             'alpha': 1.0,
@@ -106,16 +109,16 @@ def cross_validate_xgboost_regressor(
     y: np.ndarray,
     params: dict,
     n_folds: int = 10,
-    num_boost_round: int = 300,
-    early_stopping_rounds: int = 20,
+    num_boost_round: int = 2000,
+    early_stopping_rounds: int = 30,
     random_state: int = 42,
     groups: np.ndarray | None = None
 ) -> tuple[xgb.Booster, dict[str, list[float]]]:
-    """k-fold CV of an XGBoost regressor, then a refit on all rows. The inner early-stopping
-    split is not stratified: a continuous target cannot be."""
+    """k-fold CV of an XGBoost regressor, then a refit on all rows. The inner
+    cross-validation is not stratified: a continuous target cannot be."""
     print_cv_header("XGBoost", n_folds)
     return cross_validate_xgboost(
         X, y, y, params.copy(), _kfolds(X, y, n_folds, random_state, groups), stratify=None,
         fold_metrics=regression_metrics, metric_keys=CV_METRICS, headline=("r2", "R2"),
         n_folds=n_folds, num_boost_round=num_boost_round,
-        early_stopping_rounds=early_stopping_rounds, random_state=random_state)
+        early_stopping_rounds=early_stopping_rounds, random_state=random_state, groups=groups)

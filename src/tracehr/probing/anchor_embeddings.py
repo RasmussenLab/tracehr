@@ -304,7 +304,9 @@ def extract_anchor_embeddings(
               f"(min_seq_len={min_seq_len}); {len(cohort) - len(rows)} dropped for "
               f"a missing/NaN anchor, no events in the input, or fewer than "
               f"{min_seq_len} pre-anchor clinical event(s).")
-    return pd.DataFrame(rows)
+    # Rows in patient-id order (a patient's own in anchor order), whichever input file held
+    # them, so the cross-validation folds do not depend on how the input is split into files
+    return pd.DataFrame(rows).sort_values(id_col, kind="stable", ignore_index=True)
 
 
 def _rows_from_stream(model, parquet_path, *, finish, stoi, itos, preamble, type_to_id,
