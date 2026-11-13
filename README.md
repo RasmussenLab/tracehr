@@ -327,7 +327,7 @@ Alternatively:
   author  = {Aktypi, Foteini},
   title   = {{TracEHR}: Autoregressive Transformer Training \& Inference for Electronic Health Records},
   year    = {2026},
-  version = {0.1.0},
+  version = {0.2.0},
   url     = {https://github.com/RasmussenLab/tracehr},
   note    = {Rasmussen Group, Novo Nordisk Foundation Center for Basic Metabolic Research (CBMR), University of Copenhagen}
 }
